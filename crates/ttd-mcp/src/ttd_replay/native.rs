@@ -1,6 +1,7 @@
 use super::types::{
-    CursorRegisters, CursorThreadState, ReadMemoryResponse, TraceException, TraceModule,
-    TraceThread,
+    CursorRegisters, CursorThreadState, MemoryAccessDirection, MemoryAccessKind, MemoryAccessMask,
+    MemoryWatchpointResponse, ReadMemoryResponse, StepDirection, StepKind, StepResult,
+    TraceException, TraceModule, TraceThread,
 };
 use super::{Position, ResolvedSymbolConfig};
 use anyhow::{bail, Context};
@@ -110,6 +111,31 @@ struct TtdMcpCursorState {
     basic_return_value: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TtdMcpStepResult {
+    position: TtdMcpPosition,
+    previous_position: TtdMcpPosition,
+    stop_reason: u32,
+    steps_executed: u64,
+    instructions_executed: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TtdMcpMemoryWatchpointResult {
+    position: TtdMcpPosition,
+    previous_position: TtdMcpPosition,
+    stop_reason: u32,
+    found: u8,
+    thread_unique_id: u64,
+    thread_id: u32,
+    program_counter: u64,
+    match_address: u64,
+    match_size: u64,
+    match_access: u32,
+}
+
 type OpenTraceFn =
     unsafe extern "C" fn(*const u16, *const TtdMcpSymbolConfig, *mut *mut TtdMcpTrace) -> i32;
 type CloseTraceFn = unsafe extern "C" fn(*mut TtdMcpTrace);
@@ -127,6 +153,16 @@ type SetPositionFn = unsafe extern "C" fn(*mut TtdMcpCursor, TtdMcpPosition) -> 
 type ReadMemoryFn =
     unsafe extern "C" fn(*mut TtdMcpCursor, u64, *mut u8, u32, *mut TtdMcpMemoryRead) -> i32;
 type CursorStateFn = unsafe extern "C" fn(*mut TtdMcpCursor, *mut TtdMcpCursorState) -> i32;
+type StepCursorFn =
+    unsafe extern "C" fn(*mut TtdMcpCursor, u32, u32, u8, *mut TtdMcpStepResult) -> i32;
+type MemoryWatchpointFn = unsafe extern "C" fn(
+    *mut TtdMcpCursor,
+    u64,
+    u32,
+    u32,
+    u32,
+    *mut TtdMcpMemoryWatchpointResult,
+) -> i32;
 type LastErrorFn = unsafe extern "C" fn() -> *const i8;
 
 pub struct NativeBridge {
@@ -428,6 +464,105 @@ impl NativeCursor {
             basic_return_value: state.basic_return_value,
         })
     }
+
+    pub fn step(
+        &self,
+        session_id: u64,
+        cursor_id: u64,
+        direction: StepDirection,
+        kind: StepKind,
+        count: u32,
+    ) -> anyhow::Result<StepResult> {
+        let step_cursor: Symbol<StepCursorFn> =
+            unsafe { self.bridge.symbol(b"ttd_mcp_step_cursor\0")? };
+        let mut result = TtdMcpStepResult::default();
+        let native_direction = match direction {
+            StepDirection::Forward => 0,
+            StepDirection::Backward => 1,
+        };
+        let only_current_thread = matches!(kind, StepKind::Step) as u8;
+        let status = unsafe {
+            step_cursor(
+                self.handle.as_ptr(),
+                native_direction,
+                count,
+                only_current_thread,
+                &mut result,
+            )
+        };
+        self.bridge.ensure_ok(status, "stepping replay cursor")?;
+
+        Ok(StepResult {
+            session_id,
+            cursor_id,
+            position: result.position.into(),
+            previous_position: valid_position(result.previous_position).map(Into::into),
+            direction,
+            kind,
+            requested_count: count,
+            steps_executed: result.steps_executed,
+            instructions_executed: result.instructions_executed,
+            stop_reason: stop_reason_name(result.stop_reason).to_string(),
+            stop_reason_code: result.stop_reason,
+        })
+    }
+
+    pub fn memory_watchpoint(
+        &self,
+        session_id: u64,
+        cursor_id: u64,
+        address: u64,
+        size: u32,
+        access: MemoryAccessMask,
+        direction: MemoryAccessDirection,
+    ) -> anyhow::Result<MemoryWatchpointResponse> {
+        let memory_watchpoint: Symbol<MemoryWatchpointFn> =
+            unsafe { self.bridge.symbol(b"ttd_mcp_memory_watchpoint\0")? };
+        let native_access = native_memory_access_mask(access);
+        let native_direction = match direction {
+            MemoryAccessDirection::Next => 0,
+            MemoryAccessDirection::Previous => 1,
+            MemoryAccessDirection::Unknown => bail!("direction must be 'previous' or 'next'"),
+        };
+        let mut result = TtdMcpMemoryWatchpointResult::default();
+        let status = unsafe {
+            memory_watchpoint(
+                self.handle.as_ptr(),
+                address,
+                size,
+                native_access,
+                native_direction,
+                &mut result,
+            )
+        };
+        self.bridge
+            .ensure_ok(status, "replaying to a memory watchpoint")?;
+
+        let found = result.found != 0;
+        Ok(MemoryWatchpointResponse {
+            session_id,
+            cursor_id,
+            requested_address: address,
+            requested_size: size,
+            requested_access: access,
+            direction,
+            found,
+            position: result.position.into(),
+            previous_position: valid_position(result.previous_position).map(Into::into),
+            thread: (result.thread_unique_id != 0 || result.thread_id != 0).then_some(
+                CursorThreadState {
+                    unique_id: result.thread_unique_id,
+                    thread_id: result.thread_id,
+                },
+            ),
+            program_counter: result.program_counter,
+            match_address: found.then_some(result.match_address),
+            match_size: found.then_some(result.match_size),
+            match_access: found.then_some(memory_access_kind(result.match_access)),
+            stop_reason: stop_reason_name(result.stop_reason).to_string(),
+            stop_reason_code: result.stop_reason,
+        })
+    }
 }
 
 impl Drop for NativeCursor {
@@ -673,6 +808,45 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 
 fn valid_position(position: TtdMcpPosition) -> Option<TtdMcpPosition> {
     (position.sequence != u64::MAX).then_some(position)
+}
+
+fn native_memory_access_mask(access: MemoryAccessMask) -> u32 {
+    match access {
+        MemoryAccessMask::Read => 0,
+        MemoryAccessMask::Write => 1,
+        MemoryAccessMask::Execute => 2,
+        MemoryAccessMask::ReadWrite => 3,
+    }
+}
+
+fn memory_access_kind(access: u32) -> MemoryAccessKind {
+    match access {
+        0 => MemoryAccessKind::Read,
+        1 => MemoryAccessKind::Write,
+        2 => MemoryAccessKind::Execute,
+        3 => MemoryAccessKind::CodeFetch,
+        4 => MemoryAccessKind::Overwrite,
+        5 => MemoryAccessKind::DataMismatch,
+        6 => MemoryAccessKind::NewData,
+        7 => MemoryAccessKind::RedundantData,
+        _ => MemoryAccessKind::Unknown,
+    }
+}
+
+fn stop_reason_name(stop_reason: u32) -> &'static str {
+    match stop_reason {
+        0 => "MemoryWatchpoint",
+        1 => "PositionWatchpoint",
+        2 => "Exception",
+        3 => "Gap",
+        4 => "Thread",
+        5 => "StepCount",
+        6 => "Position",
+        7 => "Process",
+        8 => "Interrupted",
+        9 => "Error",
+        _ => "Unknown",
+    }
 }
 
 #[cfg(windows)]

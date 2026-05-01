@@ -1,15 +1,10 @@
 use anyhow::{bail, ensure, Context};
+mod common;
+use common::{path_string, ping_binary_paths, ping_trace_path};
 use serde_json::{json, Value};
-use std::env;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Mutex, OnceLock};
-
-const PING_TRACE_ARCHIVE: &str = "traces/ping.7z";
-const PING_TRACE_RUN: &str = "traces/ping/ping01.run";
-
-static PING_FIXTURE_EXTRACT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[test]
 fn initialize_ping_and_tools_list_roundtrip_over_stdio() -> anyhow::Result<()> {
@@ -46,31 +41,14 @@ fn initialize_ping_and_tools_list_roundtrip_over_stdio() -> anyhow::Result<()> {
         .filter_map(|tool| tool["name"].as_str())
         .collect::<Vec<_>>();
 
-    ensure!(
-        names.contains(&"ttd_load_trace"),
-        "missing ttd_load_trace tool"
-    );
-    ensure!(
-        names.contains(&"ttd_command_line"),
-        "missing ttd_command_line tool"
-    );
-    ensure!(
-        names.contains(&"ttd_read_memory"),
-        "missing ttd_read_memory tool"
-    );
+    for expected_name in expected_tool_names() {
+        ensure!(
+            names.contains(expected_name),
+            "missing {expected_name} tool"
+        );
+    }
     for tool in tools {
-        ensure!(
-            tool["name"].is_string(),
-            "tool is missing a string name: {tool}"
-        );
-        ensure!(
-            tool["description"].is_string(),
-            "tool is missing a string description: {tool}"
-        );
-        ensure!(
-            tool["inputSchema"].is_object(),
-            "tool is missing an object inputSchema: {tool}"
-        );
+        assert_tool_schema(tool)?;
     }
 
     Ok(())
@@ -164,6 +142,30 @@ fn ping_trace_replay_scenario_over_mcp_stdio() -> anyhow::Result<()> {
         "trace info should include a backend: {info}"
     );
 
+    let capabilities = client.call_tool_json(
+        43,
+        "ttd_capabilities",
+        json!({
+            "session_id": session_id,
+        }),
+    )?;
+    ensure!(
+        capabilities["session_id"] == session_id,
+        "capabilities response should echo the session id: {capabilities}"
+    );
+    ensure!(
+        capabilities["backend"] == info["backend"],
+        "capabilities response should match trace backend: {capabilities}"
+    );
+    ensure!(
+        capabilities["features"]["trace_info"] == true,
+        "capabilities response should mark trace_info as available: {capabilities}"
+    );
+    ensure!(
+        capabilities["features"]["cursor_create"] == true,
+        "capabilities response should mark cursor_create as available: {capabilities}"
+    );
+
     let cursor = client.call_tool_json(
         32,
         "ttd_cursor_create",
@@ -239,6 +241,76 @@ fn ping_trace_replay_scenario_over_mcp_stdio() -> anyhow::Result<()> {
         "native MCP module list should include ping.exe: {modules}"
     );
 
+    let module_info = client.call_tool_json(
+        44,
+        "ttd_module_info",
+        json!({
+            "session_id": session_id,
+            "name": "ping.exe",
+        }),
+    )?;
+    let ping_base = module_info["module"]["base_address"]
+        .as_u64()
+        .context("ttd_module_info response should include module base_address")?;
+    ensure!(
+        module_info["matched_by"] == "name",
+        "module_info should report name match: {module_info}"
+    );
+    ensure!(
+        module_info["module"]["name"]
+            .as_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case("ping.exe")),
+        "module_info should return ping.exe: {module_info}"
+    );
+
+    let module_by_address = client.call_tool_json(
+        45,
+        "ttd_module_info",
+        json!({
+            "session_id": session_id,
+            "address": ping_base,
+        }),
+    )?;
+    ensure!(
+        module_by_address["matched_by"] == "address",
+        "module_info should report address match: {module_by_address}"
+    );
+
+    let address_info = client.call_tool_json(
+        48,
+        "ttd_address_info",
+        json!({
+            "session_id": session_id,
+            "cursor_id": cursor_id,
+            "address": format!("{ping_base:#x}"),
+        }),
+    )?;
+    ensure!(
+        address_info["classification"] == "module",
+        "address_info should classify ping.exe base as a module address: {address_info}"
+    );
+    ensure!(
+        address_info["module"]["name"]
+            .as_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case("ping.exe")),
+        "address_info should identify ping.exe for its base address: {address_info}"
+    );
+    ensure!(
+        address_info["module"]["rva"] == 0 && address_info["module"]["rva_hex"] == "0x0",
+        "address_info should report RVA zero for a module base address: {address_info}"
+    );
+    ensure!(
+        address_info["module"]["module_offset"] == "ping.exe+0x0",
+        "address_info should report module+offset coordinates: {address_info}"
+    );
+    ensure!(
+        address_info["position"].is_object()
+            && address_info["registers"]["program_counter"]
+                .as_u64()
+                .is_some_and(|value| value != 0),
+        "address_info should include cursor position and register context: {address_info}"
+    );
+
     let registers = client.call_tool_json(
         36,
         "ttd_registers",
@@ -260,8 +332,87 @@ fn ping_trace_replay_scenario_over_mcp_stdio() -> anyhow::Result<()> {
         "register snapshot should include a non-zero stack pointer: {registers}"
     );
 
-    let command_line = client.call_tool_json(
+    let stack_info = client.call_tool_json(
+        46,
+        "ttd_stack_info",
+        json!({
+            "session_id": session_id,
+            "cursor_id": cursor_id,
+        }),
+    )?;
+    ensure!(
+        stack_info["stack_pointer"] == registers["stack_pointer"],
+        "stack_info should use the same stack pointer as registers: {stack_info}"
+    );
+    ensure!(
+        stack_info["stack_base"]
+            .as_u64()
+            .is_some_and(|value| value != 0)
+            && stack_info["stack_limit"]
+                .as_u64()
+                .is_some_and(|value| value != 0),
+        "stack_info should include non-zero stack bounds: {stack_info}"
+    );
+
+    let stack_read = client.call_tool_json(
+        47,
+        "ttd_stack_read",
+        json!({
+            "session_id": session_id,
+            "cursor_id": cursor_id,
+            "size": 128,
+            "decode_pointers": true,
+        }),
+    )?;
+    ensure!(
+        stack_read["stack_pointer"] == registers["stack_pointer"],
+        "stack_read should report the register stack pointer: {stack_read}"
+    );
+    ensure!(
+        stack_read["bytes_read"]
+            .as_u64()
+            .is_some_and(|value| value > 0),
+        "stack_read should read some stack bytes: {stack_read}"
+    );
+    ensure!(
+        stack_read["encoding"] == "hex" && stack_read["pointer_size"] == 8,
+        "stack_read should return hex data and x64 pointer size: {stack_read}"
+    );
+
+    let stepped = client.call_tool_json(
         37,
+        "ttd_step",
+        json!({
+            "session_id": session_id,
+            "cursor_id": cursor_id,
+            "direction": "forward",
+            "kind": "step",
+            "count": 1,
+        }),
+    )?;
+    ensure!(
+        stepped["position"].is_object(),
+        "step response should include the new position: {stepped}"
+    );
+    ensure!(
+        stepped["requested_count"] == 1,
+        "step response should echo requested_count: {stepped}"
+    );
+    ensure!(
+        stepped["steps_executed"]
+            .as_u64()
+            .is_some_and(|value| value <= 1),
+        "single-step response should execute at most one step: {stepped}"
+    );
+    ensure!(
+        stepped["stop_reason"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "step response should include a stop reason: {stepped}"
+    );
+
+    let command_line = client.call_tool_json(
+        38,
         "ttd_command_line",
         json!({
             "session_id": session_id,
@@ -280,7 +431,7 @@ fn ping_trace_replay_scenario_over_mcp_stdio() -> anyhow::Result<()> {
         .as_u64()
         .context("native trace info should include a PEB address")?;
     let memory = client.call_tool_json(
-        38,
+        39,
         "ttd_read_memory",
         json!({
             "session_id": session_id,
@@ -300,8 +451,66 @@ fn ping_trace_replay_scenario_over_mcp_stdio() -> anyhow::Result<()> {
         "memory response should be hex encoded: {memory}"
     );
 
+    let command_line_address = command_line["command_line_address"]
+        .as_u64()
+        .context("ttd_command_line response should include command_line_address")?;
+    let end_position = client.call_tool_json(
+        40,
+        "ttd_position_set",
+        json!({
+            "session_id": session_id,
+            "cursor_id": cursor_id,
+            "position": 100,
+        }),
+    )?;
+    ensure!(
+        end_position["position"].is_object(),
+        "position_set to trace end should include a position: {end_position}"
+    );
+
+    let watchpoint = client.call_tool_json(
+        41,
+        "ttd_memory_watchpoint",
+        json!({
+            "session_id": session_id,
+            "cursor_id": cursor_id,
+            "address": command_line_address,
+            "size": 16,
+            "access": "read",
+            "direction": "previous",
+        }),
+    )?;
+    ensure!(
+        watchpoint["requested_address"] == command_line_address,
+        "watchpoint response should echo requested_address: {watchpoint}"
+    );
+    ensure!(
+        watchpoint["requested_size"] == 16,
+        "watchpoint response should echo requested_size: {watchpoint}"
+    );
+    ensure!(
+        watchpoint["requested_access"] == "read" && watchpoint["direction"] == "previous",
+        "watchpoint response should echo access and direction: {watchpoint}"
+    );
+    ensure!(
+        watchpoint["found"] == true,
+        "watchpoint should find a previous command-line buffer read: {watchpoint}"
+    );
+    ensure!(
+        watchpoint["position"].is_object(),
+        "watchpoint response should include the new cursor position: {watchpoint}"
+    );
+    ensure!(
+        watchpoint["match_access"] == "read",
+        "watchpoint hit should report a read access: {watchpoint}"
+    );
+    ensure!(
+        watchpoint["stop_reason"] == "MemoryWatchpoint",
+        "watchpoint hit should report a memory-watchpoint stop: {watchpoint}"
+    );
+
     let closed = client.call_tool_json(
-        39,
+        42,
         "ttd_close_trace",
         json!({
             "session_id": session_id,
@@ -430,125 +639,99 @@ fn parse_tool_json(response: &Value) -> anyhow::Result<Value> {
 }
 
 fn ping_load_trace_args(trace_path: &Path) -> Value {
-    let mut binary_paths = Vec::new();
-    if let Some(trace_dir) = trace_path.parent() {
-        let binary_path = trace_dir.join("ping.exe");
-        if binary_path.is_file() {
-            binary_paths.push(path_string(&binary_path));
-        }
-    }
-
     json!({
         "trace_path": path_string(trace_path),
         "symbols": {
-            "binary_paths": binary_paths,
+            "binary_paths": ping_binary_paths(trace_path),
         }
     })
 }
 
-fn ping_trace_path() -> anyhow::Result<Option<PathBuf>> {
-    if let Some(path) = env::var_os("TTD_TEST_TRACE").map(PathBuf::from) {
-        ensure!(
-            path.is_file(),
-            "TTD_TEST_TRACE does not point to a file: {}",
-            path.display()
-        );
-        return Ok(Some(path));
-    }
-
-    let default_trace = workspace_root().join(PING_TRACE_RUN);
-    if default_trace.is_file() {
-        return Ok(Some(default_trace));
-    }
-
-    if !ensure_ping_fixture_extracted()? {
-        return Ok(None);
-    }
-
-    Ok(default_trace.is_file().then_some(default_trace))
+fn expected_tool_names() -> &'static [&'static str] {
+    &[
+        "ttd_load_trace",
+        "ttd_close_trace",
+        "ttd_trace_info",
+        "ttd_capabilities",
+        "ttd_list_threads",
+        "ttd_list_modules",
+        "ttd_module_info",
+        "ttd_address_info",
+        "ttd_list_exceptions",
+        "ttd_cursor_create",
+        "ttd_position_get",
+        "ttd_position_set",
+        "ttd_step",
+        "ttd_registers",
+        "ttd_stack_info",
+        "ttd_stack_read",
+        "ttd_command_line",
+        "ttd_read_memory",
+        "ttd_memory_watchpoint",
+    ]
 }
 
-fn ensure_ping_fixture_extracted() -> anyhow::Result<bool> {
-    let fixture_lock = PING_FIXTURE_EXTRACT_LOCK.get_or_init(|| Mutex::new(()));
-    let _guard = fixture_lock
-        .lock()
-        .map_err(|error| anyhow::anyhow!("ping fixture extraction lock is poisoned: {error}"))?;
-
-    let root = workspace_root();
-    let default_trace = root.join(PING_TRACE_RUN);
-    if default_trace.is_file() {
-        return Ok(true);
-    }
-
-    let archive_path = root.join(PING_TRACE_ARCHIVE);
-    if !archive_path.is_file() {
-        eprintln!(
-            "ping trace archive is not present at {}; tests can still use TTD_TEST_TRACE",
-            archive_path.display()
-        );
-        return Ok(false);
-    }
-
-    let Some(seven_zip) = seven_zip_command() else {
-        eprintln!(
-            "ping trace archive is present at {}, but no 7z/7zz executable was found; set TTD_TEST_7Z to extract automatically",
-            archive_path.display()
-        );
-        return Ok(false);
-    };
-
-    let traces_dir = root.join("traces");
-    std::fs::create_dir_all(&traces_dir)
-        .with_context(|| format!("creating {}", traces_dir.display()))?;
-    let output = Command::new(&seven_zip)
-        .arg("x")
-        .arg(&archive_path)
-        .arg(format!("-o{}", traces_dir.display()))
-        .arg("-y")
-        .output()
-        .with_context(|| format!("running {}", seven_zip.display()))?;
-
-    if !output.status.success() {
-        bail!(
-            "failed to extract {} with {}\nstdout:\n{}\nstderr:\n{}",
-            archive_path.display(),
-            seven_zip.display(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
+fn assert_tool_schema(tool: &Value) -> anyhow::Result<()> {
+    let name = tool["name"]
+        .as_str()
+        .context("tool is missing a string name")?;
     ensure!(
-        default_trace.is_file(),
-        "extracted {}, but {} was not created",
-        archive_path.display(),
-        default_trace.display()
+        tool["description"].is_string(),
+        "tool is missing a string description: {tool}"
     );
-
-    Ok(true)
-}
-
-fn seven_zip_command() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("TTD_TEST_7Z") {
-        return Some(PathBuf::from(path));
+    let schema = &tool["inputSchema"];
+    ensure!(
+        schema.is_object(),
+        "tool is missing an object inputSchema: {tool}"
+    );
+    ensure!(
+        schema["type"] == "object",
+        "tool inputSchema should be an object schema: {tool}"
+    );
+    ensure!(
+        schema["properties"].is_object(),
+        "tool inputSchema should include object properties: {tool}"
+    );
+    for required in required_args_for_tool(name)? {
+        ensure!(
+            schema["required"]
+                .as_array()
+                .is_some_and(|args| args.iter().any(|arg| arg == required)),
+            "tool {name} inputSchema is missing required argument {required}: {tool}"
+        );
     }
-
-    ["7z", "7zz"]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|candidate| Command::new(candidate).arg("i").output().is_ok())
+    Ok(())
 }
 
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("crate lives under <workspace>/crates/ttd-mcp")
-        .to_path_buf()
-}
-
-fn path_string(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+fn required_args_for_tool(name: &str) -> anyhow::Result<&'static [&'static str]> {
+    match name {
+        "ttd_load_trace" => Ok(&["trace_path"]),
+        "ttd_close_trace"
+        | "ttd_trace_info"
+        | "ttd_capabilities"
+        | "ttd_list_threads"
+        | "ttd_list_modules"
+        | "ttd_module_info"
+        | "ttd_list_exceptions"
+        | "ttd_cursor_create" => Ok(&["session_id"]),
+        "ttd_position_get" | "ttd_registers" | "ttd_stack_info" | "ttd_command_line" => {
+            Ok(&["session_id", "cursor_id"])
+        }
+        "ttd_address_info" => Ok(&["session_id", "cursor_id", "address"]),
+        "ttd_position_set" => Ok(&["session_id", "cursor_id", "position"]),
+        "ttd_step" => Ok(&["session_id", "cursor_id"]),
+        "ttd_stack_read" => Ok(&["session_id", "cursor_id"]),
+        "ttd_read_memory" => Ok(&["session_id", "cursor_id", "address", "size"]),
+        "ttd_memory_watchpoint" => Ok(&[
+            "session_id",
+            "cursor_id",
+            "address",
+            "size",
+            "access",
+            "direction",
+        ]),
+        _ => bail!("unexpected tool listed by server: {name}"),
+    }
 }
 
 fn assert_success_id(response: &Value, expected_id: u64) -> anyhow::Result<()> {

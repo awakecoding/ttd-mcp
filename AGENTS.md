@@ -27,7 +27,7 @@ Do not bind Rust directly to TTD C++ vtables, STL helper types, or C++ ownership
 
 ## Current Implementation State
 
-The Rust MCP server uses `rmcp` for stdio MCP protocol handling, advertises tools, and can use the native bridge for trace loading, trace metadata, thread/module/exception enumeration, cursor creation, position get/set, core cursor register/thread state, bounded guest memory reads, and PEB-backed command-line extraction when `ttd_replay_bridge.dll` and TTD runtime DLLs are available. Stepping and watchpoints still need native-backed implementations.
+The Rust MCP server uses `rmcp` for stdio MCP protocol handling, advertises tools, and can use the native bridge for trace loading, trace metadata, thread/module/exception enumeration, cursor creation, position get/set, stepping/tracing, core cursor register/thread state, bounded guest memory reads, memory watchpoint replay, and PEB-backed command-line extraction when `ttd_replay_bridge.dll` and TTD runtime DLLs are available.
 
 ## Build And Check Commands
 
@@ -110,8 +110,8 @@ Close the program cleanly so TTD finalizes the `.run` and `.idx` files.
 
 ## Likely Next Implementation Steps
 
-1. Add stepping/trace movement and memory watchpoint search.
-2. Add full architecture-specific register contexts beyond the compact PC/SP/FP/TEB snapshot.
-3. Add process artifact helpers beyond command-line extraction, such as basic stack inspection.
-4. Expand module output with symbol loading details once symbolication is wired beyond raw module paths.
+1. Add full architecture-specific register contexts beyond the compact PC/SP/FP/TEB snapshot.
+2. Add process artifact helpers beyond command-line extraction, such as basic stack inspection.
+3. Expand module output with symbol loading details once symbolication is wired beyond raw module paths.
+4. Add optional watchpoint replay limits or thread filters if large traces need narrower searches.
 5. Expand black-box MCP stdio tests alongside new replay-backed tool behavior.

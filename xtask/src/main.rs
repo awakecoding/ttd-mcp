@@ -1,8 +1,9 @@
 use anyhow::{bail, ensure, Context};
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 const DEBUGGING_PLATFORM_VERSION: &str = "20260319.1511.0";
 const DEFAULT_SYMBOL_CACHE: &str = ".ttd-symbol-cache";
@@ -37,9 +38,10 @@ fn main() -> anyhow::Result<()> {
         Some("deps") => deps(),
         Some("native-build") => native_build(),
         Some("package") => package(),
+        Some("mcp-smoke") => mcp_smoke(),
         Some(command) => bail!("unknown xtask command: {command}"),
         None => {
-            eprintln!("Usage: cargo xtask <doctor|deps|native-build|package>");
+            eprintln!("Usage: cargo xtask <doctor|deps|native-build|package|mcp-smoke>");
             Ok(())
         }
     }
@@ -184,6 +186,86 @@ fn package() -> anyhow::Result<()> {
         )?;
     }
     println!("Package directory prepared at {}", package_dir.display());
+    Ok(())
+}
+
+fn mcp_smoke() -> anyhow::Result<()> {
+    let root = workspace_root()?;
+    run(Command::new("cargo").arg("build").arg("-p").arg("ttd-mcp"))
+        .context("building ttd-mcp before packaged MCP smoke test")?;
+    package().context("preparing MCP package directory")?;
+
+    let package_dir = root.join("target/package");
+    let server_path = package_dir.join("ttd-mcp.exe");
+    ensure!(
+        server_path.is_file(),
+        "packaged server was not found at {}",
+        server_path.display()
+    );
+
+    let mut client = SmokeClient::start(&server_path, &package_dir)?;
+    client.initialize()?;
+    let tools = client.request(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list",
+        "params": {}
+    }))?;
+    assert_response_id(&tools, 2)?;
+    let tool_names = tools["result"]["tools"]
+        .as_array()
+        .context("tools/list result should include tools")?
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    ensure!(
+        tool_names.contains(&"ttd_load_trace")
+            && tool_names.contains(&"ttd_capabilities")
+            && tool_names.contains(&"ttd_module_info")
+            && tool_names.contains(&"ttd_address_info")
+            && tool_names.contains(&"ttd_stack_info")
+            && tool_names.contains(&"ttd_stack_read")
+            && tool_names.contains(&"ttd_read_memory"),
+        "packaged MCP server did not advertise expected tools: {tools}"
+    );
+
+    let trace_path = root.join("traces/ping/ping01.run");
+    if trace_path.is_file() {
+        let loaded = client.call_tool_json(
+            3,
+            "ttd_load_trace",
+            serde_json::json!({
+                "trace_path": path_string(&trace_path),
+                "symbols": {
+                    "binary_paths": ping_binary_paths(&trace_path),
+                }
+            }),
+        )?;
+        let session_id = loaded["session_id"]
+            .as_u64()
+            .context("ttd_load_trace should return a session id")?;
+        let capabilities = client.call_tool_json(
+            4,
+            "ttd_capabilities",
+            serde_json::json!({ "session_id": session_id }),
+        )?;
+        ensure!(
+            capabilities["features"]["trace_info"] == true,
+            "ttd_capabilities should report trace_info support: {capabilities}"
+        );
+        client.call_tool_json(
+            5,
+            "ttd_close_trace",
+            serde_json::json!({ "session_id": session_id }),
+        )?;
+    } else {
+        println!(
+            "  info: skipping packaged trace load smoke; {} is not present",
+            trace_path.display()
+        );
+    }
+
+    println!("Packaged MCP smoke test passed");
     Ok(())
 }
 
@@ -352,6 +434,136 @@ fn copy_first_existing(sources: Vec<PathBuf>, destination: &Path) -> anyhow::Res
             .unwrap_or_else(|| NATIVE_BRIDGE_DLL.to_string())
     );
     Ok(())
+}
+
+struct SmokeClient {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl SmokeClient {
+    fn start(server_path: &Path, current_dir: &Path) -> anyhow::Result<Self> {
+        let mut child = Command::new(server_path)
+            .current_dir(current_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("spawning packaged MCP server {}", server_path.display()))?;
+        let stdin = child.stdin.take().context("child stdin was not piped")?;
+        let stdout = child.stdout.take().context("child stdout was not piped")?;
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        })
+    }
+
+    fn initialize(&mut self) -> anyhow::Result<()> {
+        let response = self.request(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "ttd-mcp-package-smoke",
+                    "version": "0.0.0"
+                }
+            }
+        }))?;
+        assert_response_id(&response, 1)?;
+        self.notify(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        }))
+    }
+
+    fn notify(&mut self, value: serde_json::Value) -> anyhow::Result<()> {
+        writeln!(self.stdin, "{}", serde_json::to_string(&value)?)?;
+        self.stdin.flush()?;
+        Ok(())
+    }
+
+    fn request(&mut self, value: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        writeln!(self.stdin, "{}", serde_json::to_string(&value)?)?;
+        self.stdin.flush()?;
+
+        let mut response = String::new();
+        let bytes = self.stdout.read_line(&mut response)?;
+        ensure!(bytes > 0, "server closed stdout before writing a response");
+        serde_json::from_str(response.trim_end()).context("parsing MCP response")
+    }
+
+    fn call_tool_json(
+        &mut self,
+        id: u64,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let response = self.request(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": name,
+                "arguments": arguments,
+            }
+        }))?;
+        assert_response_id(&response, id)?;
+        ensure!(
+            response["result"]["isError"].as_bool() != Some(true),
+            "{name} returned an MCP tool error: {response}"
+        );
+        parse_tool_json(&response)
+    }
+}
+
+impl Drop for SmokeClient {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn assert_response_id(response: &serde_json::Value, expected_id: u64) -> anyhow::Result<()> {
+    ensure!(
+        response["jsonrpc"] == "2.0",
+        "missing JSON-RPC version: {response}"
+    );
+    ensure!(
+        response["id"] == expected_id,
+        "unexpected response id: {response}"
+    );
+    ensure!(
+        response.get("error").is_none(),
+        "response should not be an error: {response}"
+    );
+    Ok(())
+}
+
+fn parse_tool_json(response: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("tool result should include text content")?;
+    serde_json::from_str(text).context("parsing tool result JSON")
+}
+
+fn ping_binary_paths(trace_path: &Path) -> Vec<String> {
+    trace_path
+        .parent()
+        .map(|trace_dir| trace_dir.join("ping.exe"))
+        .filter(|binary_path| binary_path.is_file())
+        .map(|binary_path| vec![path_string(&binary_path)])
+        .unwrap_or_default()
+}
+
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 fn run(command: &mut Command) -> anyhow::Result<()> {

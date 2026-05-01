@@ -4,14 +4,17 @@ use super::{Position, ResolvedSymbolConfig};
 use anyhow::{bail, ensure};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 
 const PEB_PROCESS_PARAMETERS_OFFSET_X64: usize = 0x20;
+const TEB_STACK_BASE_OFFSET_X64: usize = 0x08;
+const TEB_STACK_LIMIT_OFFSET_X64: usize = 0x10;
 const RTL_USER_PROCESS_PARAMETERS_COMMAND_LINE_OFFSET_X64: usize = 0x70;
 const UNICODE_STRING_X64_SIZE: usize = 16;
 const MAX_COMMAND_LINE_BYTES: usize = 0x8000;
+const MAX_STACK_READ_BYTES: u32 = 0x1000;
+const POINTER_SIZE_X64: usize = 8;
 
 pub type SessionId = u64;
 pub type CursorId = u64;
@@ -87,6 +90,66 @@ impl SessionRegistry {
         Ok(self.session(session_id)?.info.clone())
     }
 
+    pub fn capabilities(&self, session_id: SessionId) -> anyhow::Result<CapabilitiesResponse> {
+        let session = self.session(session_id)?;
+        let native = session.native.is_some();
+        let command_line = native && session.info.peb_address.is_some();
+        let mut limitations = Vec::new();
+
+        if let Some(warning) = session.info.warning.as_ref() {
+            limitations.push(warning.clone());
+        }
+        if !native {
+            limitations.push(
+                "native replay is unavailable; cursor replay, registers, memory, and watchpoints require the native bridge".to_string(),
+            );
+        }
+        limitations.extend([
+            "full register contexts are not exposed yet".to_string(),
+            "memory region enumeration is not exposed yet".to_string(),
+            "symbol resolution is not exposed yet".to_string(),
+            "API/call tracing is not exposed yet".to_string(),
+            "console/stdout/network summary helpers are not exposed yet".to_string(),
+        ]);
+
+        Ok(CapabilitiesResponse {
+            session_id,
+            backend: session.info.backend.clone(),
+            native,
+            symbols: session.symbols.clone(),
+            features: ReplayCapabilities {
+                trace_info: true,
+                close_trace: true,
+                list_threads: native,
+                list_modules: native,
+                module_info: native,
+                address_info: native,
+                list_exceptions: native,
+                cursor_create: true,
+                position_get: true,
+                position_set: true,
+                step: native,
+                compact_registers: native,
+                full_registers: false,
+                stack_info: native,
+                stack_read: native,
+                command_line,
+                read_memory: native,
+                memory_watchpoint: native,
+                memory_regions: false,
+                search_memory: false,
+                search_trace_strings: false,
+                symbol_resolution: false,
+                api_calls: false,
+                call_trace: false,
+                console_output: false,
+                stdout_events: false,
+                network_summary: false,
+            },
+            limitations,
+        })
+    }
+
     pub fn list_threads(&self, session_id: SessionId) -> anyhow::Result<Vec<TraceThread>> {
         let session = self.session(session_id)?;
         if let Some(native) = session.native.as_ref() {
@@ -107,6 +170,80 @@ impl SessionRegistry {
             modules: Vec::new(),
         }
         .with_symbol_hint(session.symbols.symbol_path.clone()))
+    }
+
+    pub fn module_info(&self, request: ModuleInfoRequest) -> anyhow::Result<ModuleInfoResponse> {
+        ensure!(
+            request.name.is_some() || request.address.is_some(),
+            "name or address is required"
+        );
+        let modules = self.list_modules(request.session_id)?.modules;
+
+        if let Some(address) = request.address {
+            if let Some(module) = modules
+                .iter()
+                .find(|module| address_in_module(address, module))
+                .cloned()
+            {
+                return Ok(ModuleInfoResponse {
+                    session_id: request.session_id,
+                    matched_by: "address".to_string(),
+                    module,
+                });
+            }
+        }
+
+        if let Some(name) = request.name.as_deref() {
+            if let Some(module) = modules
+                .iter()
+                .find(|module| module_name_matches(module, name))
+                .cloned()
+            {
+                return Ok(ModuleInfoResponse {
+                    session_id: request.session_id,
+                    matched_by: "name".to_string(),
+                    module,
+                });
+            }
+        }
+
+        bail!("no matching module found")
+    }
+
+    pub fn address_info(&self, request: AddressInfoRequest) -> anyhow::Result<AddressInfoResponse> {
+        let address = parse_address(&request.address)?;
+        let registers = self.registers(request.session_id, request.cursor_id)?;
+        let session = self.session(request.session_id)?;
+        let peb_address = session.info.peb_address;
+        let modules = self.list_modules(request.session_id)?.modules;
+        let module = modules
+            .iter()
+            .find(|module| address_in_module(address, module))
+            .map(|module| module_coordinate(address, module));
+        let stack = self
+            .stack_info(request.session_id, request.cursor_id)
+            .ok()
+            .map(|stack| stack_context(address, &stack));
+        let classification = classify_address(
+            address,
+            &registers,
+            peb_address,
+            module.as_ref(),
+            stack.as_ref(),
+        );
+
+        Ok(AddressInfoResponse {
+            session_id: request.session_id,
+            cursor_id: request.cursor_id,
+            address,
+            address_hex: hex_u64(address),
+            position: registers.position,
+            thread: registers.thread.clone(),
+            classification,
+            module,
+            registers: register_context(&registers),
+            stack,
+        })
     }
 
     pub fn list_exceptions(&self, session_id: SessionId) -> anyhow::Result<Vec<TraceException>> {
@@ -179,12 +316,23 @@ impl SessionRegistry {
         })
     }
 
-    pub fn step(&mut self, request: StepRequest) -> anyhow::Result<Value> {
-        let _ = self.cursor_mut(request.session_id, request.cursor_id)?;
+    pub fn step(&mut self, request: StepRequest) -> anyhow::Result<StepResult> {
         ensure!(request.count > 0, "count must be greater than zero");
         ensure!(request.count <= 10_000, "count must be 10,000 or less");
-        let _ = (request.direction, request.kind);
-        bail!("ttd_step is not implemented in the native TTD Replay API bridge yet")
+        let cursor = self.cursor_mut(request.session_id, request.cursor_id)?;
+        let Some(native) = cursor.native.as_ref() else {
+            bail!("ttd_step requires a native TTD replay cursor")
+        };
+
+        let result = native.step(
+            request.session_id,
+            request.cursor_id,
+            request.direction,
+            request.kind,
+            request.count,
+        )?;
+        cursor.position = result.position;
+        Ok(result)
     }
 
     pub fn registers(
@@ -198,6 +346,85 @@ impl SessionRegistry {
         };
 
         native.registers(session_id, cursor_id)
+    }
+
+    pub fn stack_info(
+        &self,
+        session_id: SessionId,
+        cursor_id: CursorId,
+    ) -> anyhow::Result<StackInfo> {
+        let registers = self.registers(session_id, cursor_id)?;
+        let teb_address = registers
+            .teb_address
+            .ok_or_else(|| anyhow::anyhow!("register state does not include a TEB address"))?;
+        let cursor = self.cursor(session_id, cursor_id)?;
+        let teb = read_exact_memory(
+            cursor,
+            session_id,
+            cursor_id,
+            teb_address,
+            (TEB_STACK_LIMIT_OFFSET_X64 + POINTER_SIZE_X64) as u32,
+            "TEB stack fields",
+        )?;
+        let stack_base = read_u64(&teb, TEB_STACK_BASE_OFFSET_X64)
+            .ok_or_else(|| anyhow::anyhow!("TEB read did not include StackBase"))?;
+        let stack_limit = read_u64(&teb, TEB_STACK_LIMIT_OFFSET_X64)
+            .ok_or_else(|| anyhow::anyhow!("TEB read did not include StackLimit"))?;
+        let stack_pointer_in_range =
+            stack_limit <= registers.stack_pointer && registers.stack_pointer <= stack_base;
+
+        Ok(StackInfo {
+            session_id,
+            cursor_id,
+            position: registers.position,
+            thread: registers.thread,
+            teb_address,
+            stack_base,
+            stack_limit,
+            stack_pointer: registers.stack_pointer,
+            frame_pointer: registers.frame_pointer,
+            stack_pointer_in_range,
+        })
+    }
+
+    pub fn stack_read(&self, request: StackReadRequest) -> anyhow::Result<StackReadResponse> {
+        ensure!(request.size > 0, "size must be greater than zero");
+        ensure!(
+            request.size <= MAX_STACK_READ_BYTES,
+            "size must be 4 KiB or less"
+        );
+        let registers = self.registers(request.session_id, request.cursor_id)?;
+        let address = apply_i64_offset(registers.stack_pointer, request.offset_from_sp)?;
+        ensure!(address != 0, "computed stack read address must be non-zero");
+        let memory = self.read_memory(ReadMemoryRequest {
+            session_id: request.session_id,
+            cursor_id: request.cursor_id,
+            address,
+            size: request.size,
+        })?;
+        let pointers = if request.decode_pointers {
+            let bytes = hex_to_bytes(&memory.data)?;
+            let modules = self.list_modules(request.session_id)?.modules;
+            decode_stack_pointers(memory.address, &bytes, &modules)
+        } else {
+            Vec::new()
+        };
+
+        Ok(StackReadResponse {
+            session_id: request.session_id,
+            cursor_id: request.cursor_id,
+            position: registers.position,
+            stack_pointer: registers.stack_pointer,
+            offset_from_sp: request.offset_from_sp,
+            address: memory.address,
+            requested_size: request.size,
+            bytes_read: memory.bytes_read,
+            complete: memory.complete,
+            encoding: memory.encoding,
+            data: memory.data,
+            pointer_size: POINTER_SIZE_X64 as u8,
+            pointers,
+        })
     }
 
     pub fn command_line(
@@ -300,12 +527,27 @@ impl SessionRegistry {
         )
     }
 
-    pub fn memory_watchpoint(&self, request: MemoryWatchpointRequest) -> anyhow::Result<Value> {
+    pub fn memory_watchpoint(
+        &mut self,
+        request: MemoryWatchpointRequest,
+    ) -> anyhow::Result<MemoryWatchpointResponse> {
         ensure!(request.size > 0, "size must be greater than zero");
         ensure!(request.address != 0, "address must be non-zero");
-        let _ = request.access;
-        let _ = self.cursor(request.session_id, request.cursor_id)?;
-        bail!("ttd_memory_watchpoint is not implemented in the native TTD Replay API bridge yet")
+        let cursor = self.cursor_mut(request.session_id, request.cursor_id)?;
+        let Some(native) = cursor.native.as_ref() else {
+            bail!("ttd_memory_watchpoint requires a native TTD replay cursor")
+        };
+
+        let result = native.memory_watchpoint(
+            request.session_id,
+            request.cursor_id,
+            request.address,
+            request.size,
+            request.access,
+            request.direction,
+        )?;
+        cursor.position = result.position;
+        Ok(result)
     }
 
     fn allocate_session_id(&mut self) -> SessionId {
@@ -414,6 +656,154 @@ fn utf16le_to_string(bytes: &[u8]) -> anyhow::Result<String> {
         .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
         .collect::<Vec<_>>();
     String::from_utf16(&units).map_err(Into::into)
+}
+
+fn apply_i64_offset(base: u64, offset: i64) -> anyhow::Result<u64> {
+    let address = if offset >= 0 {
+        base.checked_add(offset as u64)
+    } else {
+        base.checked_sub(offset.unsigned_abs())
+    };
+    address.ok_or_else(|| anyhow::anyhow!("stack offset is outside the guest address range"))
+}
+
+fn decode_stack_pointers(
+    stack_address: u64,
+    bytes: &[u8],
+    modules: &[TraceModule],
+) -> Vec<StackPointerValue> {
+    bytes
+        .chunks_exact(POINTER_SIZE_X64)
+        .enumerate()
+        .filter_map(|(index, chunk)| {
+            let offset = (index * POINTER_SIZE_X64) as u32;
+            let raw: [u8; POINTER_SIZE_X64] = chunk.try_into().ok()?;
+            let value = u64::from_le_bytes(raw);
+            if value == 0 {
+                return None;
+            }
+            Some(StackPointerValue {
+                offset,
+                address: stack_address.saturating_add(offset as u64),
+                value,
+                module: modules
+                    .iter()
+                    .find(|module| address_in_module(value, module))
+                    .map(|module| module.name.clone()),
+            })
+        })
+        .collect()
+}
+
+fn address_in_module(address: u64, module: &TraceModule) -> bool {
+    let Some(end) = module.base_address.checked_add(module.size) else {
+        return false;
+    };
+    module.base_address <= address && address < end
+}
+
+fn module_name_matches(module: &TraceModule, query: &str) -> bool {
+    module.name.eq_ignore_ascii_case(query)
+        || module
+            .path
+            .as_ref()
+            .is_some_and(|path| path.to_string_lossy().eq_ignore_ascii_case(query))
+        || module.path.as_ref().is_some_and(|path| {
+            path.file_name()
+                .is_some_and(|file_name| file_name.to_string_lossy().eq_ignore_ascii_case(query))
+        })
+}
+
+fn parse_address(address: &str) -> anyhow::Result<u64> {
+    let trimmed = address.trim();
+    ensure!(!trimmed.is_empty(), "address must not be empty");
+    let (digits, radix) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .map(|hex| (hex, 16))
+        .unwrap_or((trimmed, 10));
+    ensure!(!digits.is_empty(), "address must include digits");
+    u64::from_str_radix(digits, radix)
+        .map_err(|error| anyhow::anyhow!("invalid address {address:?}: {error}"))
+}
+
+fn classify_address(
+    address: u64,
+    registers: &CursorRegisters,
+    peb_address: Option<u64>,
+    module: Option<&AddressModuleCoordinate>,
+    stack: Option<&AddressStackContext>,
+) -> AddressClassification {
+    if module.is_some() {
+        AddressClassification::Module
+    } else if stack.is_some_and(|stack| stack.address_in_stack) {
+        AddressClassification::Stack
+    } else if registers.teb_address == Some(address) {
+        AddressClassification::Teb
+    } else if peb_address == Some(address) {
+        AddressClassification::Peb
+    } else {
+        AddressClassification::Unknown
+    }
+}
+
+fn module_coordinate(address: u64, module: &TraceModule) -> AddressModuleCoordinate {
+    let rva = address - module.base_address;
+    AddressModuleCoordinate {
+        name: module.name.clone(),
+        path: module.path.clone(),
+        runtime_base: module.base_address,
+        runtime_base_hex: hex_u64(module.base_address),
+        size: module.size,
+        size_hex: hex_u64(module.size),
+        rva,
+        rva_hex: hex_u64(rva),
+        module_offset: format!("{}+{}", module.name, hex_u64(rva)),
+        load_position: module.load_position,
+        unload_position: module.unload_position,
+    }
+}
+
+fn register_context(registers: &CursorRegisters) -> AddressRegisterContext {
+    AddressRegisterContext {
+        program_counter: registers.program_counter,
+        program_counter_hex: hex_u64(registers.program_counter),
+        stack_pointer: registers.stack_pointer,
+        stack_pointer_hex: hex_u64(registers.stack_pointer),
+        frame_pointer: registers.frame_pointer,
+        frame_pointer_hex: hex_u64(registers.frame_pointer),
+        basic_return_value: registers.basic_return_value,
+        basic_return_value_hex: hex_u64(registers.basic_return_value),
+        teb_address: registers.teb_address,
+        teb_address_hex: registers.teb_address.map(hex_u64),
+    }
+}
+
+fn stack_context(address: u64, stack: &StackInfo) -> AddressStackContext {
+    AddressStackContext {
+        stack_base: stack.stack_base,
+        stack_base_hex: hex_u64(stack.stack_base),
+        stack_limit: stack.stack_limit,
+        stack_limit_hex: hex_u64(stack.stack_limit),
+        stack_pointer_in_range: stack.stack_pointer_in_range,
+        address_in_stack: stack.stack_limit <= address && address < stack.stack_base,
+        offset_from_sp: signed_delta(address, stack.stack_pointer),
+        offset_from_fp: signed_delta(address, stack.frame_pointer),
+    }
+}
+
+fn signed_delta(address: u64, base: u64) -> Option<i64> {
+    if address >= base {
+        i64::try_from(address - base).ok()
+    } else {
+        i64::try_from(base - address)
+            .ok()
+            .and_then(i64::checked_neg)
+    }
+}
+
+fn hex_u64(value: u64) -> String {
+    format!("{value:#x}")
 }
 
 fn try_open_native_trace(

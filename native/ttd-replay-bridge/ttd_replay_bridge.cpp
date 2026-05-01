@@ -87,6 +87,29 @@ TtdMcpStatus set_required_count(size_t required, uint32_t* count) noexcept {
     *count = static_cast<uint32_t>(required);
     return TTD_MCP_OK;
 }
+
+bool to_data_access_mask(uint32_t value, TTD::Replay::DataAccessMask* access_mask) noexcept {
+    if (access_mask == nullptr) {
+        return false;
+    }
+
+    switch (value) {
+    case 0:
+        *access_mask = TTD::Replay::DataAccessMask::Read;
+        return true;
+    case 1:
+        *access_mask = TTD::Replay::DataAccessMask::Write;
+        return true;
+    case 2:
+        *access_mask = TTD::Replay::DataAccessMask::Execute;
+        return true;
+    case 3:
+        *access_mask = TTD::Replay::DataAccessMask::ReadWrite;
+        return true;
+    default:
+        return false;
+    }
+}
 }
 
 struct TtdMcpTrace {
@@ -377,6 +400,113 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_cursor_state(TtdMcpCursor* cursor, TtdMcpCur
     };
     return TTD_MCP_OK;
 }
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_step_cursor(TtdMcpCursor* cursor, uint32_t direction, uint32_t count, uint8_t only_current_thread, TtdMcpStepResult* result) {
+    if (cursor == nullptr || result == nullptr) {
+        set_error("cursor and result pointers are required");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    if (count == 0) {
+        set_error("count must be greater than zero");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    if (direction > 1) {
+        set_error("direction must be 0 for forward or 1 for backward");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    std::scoped_lock lock(cursor->trace->mutex);
+    TTD::Replay::ReplayFlags const previous_flags = cursor->cursor->GetReplayFlags();
+    TTD::Replay::ReplayFlags next_flags = previous_flags;
+    if (only_current_thread != 0) {
+        next_flags = next_flags | TTD::Replay::ReplayOnlyCurrentThread;
+    }
+    cursor->cursor->SetReplayFlags(next_flags);
+
+    TTD::Replay::ICursorView::ReplayResult const replay_result = direction == 0
+        ? cursor->cursor->ReplayForward(static_cast<TTD::Replay::StepCount>(count))
+        : cursor->cursor->ReplayBackward(static_cast<TTD::Replay::StepCount>(count));
+
+    cursor->cursor->SetReplayFlags(previous_flags);
+
+    *result = TtdMcpStepResult{
+        to_bridge_position(cursor->cursor->GetPosition()),
+        to_bridge_position(cursor->cursor->GetPreviousPosition()),
+        static_cast<uint32_t>(replay_result.StopReason),
+        static_cast<uint64_t>(replay_result.StepsExecuted),
+        static_cast<uint64_t>(replay_result.InstructionsExecuted),
+    };
+    return TTD_MCP_OK;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_memory_watchpoint(TtdMcpCursor* cursor, uint64_t address, uint32_t size, uint32_t access_mask, uint32_t direction, TtdMcpMemoryWatchpointResult* result) {
+    if (cursor == nullptr || result == nullptr) {
+        set_error("cursor and result pointers are required");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    if (address == 0) {
+        set_error("address must be non-zero");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    if (size == 0) {
+        set_error("size must be greater than zero");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    if (direction > 1) {
+        set_error("direction must be 0 for forward or 1 for backward");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    TTD::Replay::DataAccessMask native_access_mask = TTD::Replay::DataAccessMask::None;
+    if (!to_data_access_mask(access_mask, &native_access_mask)) {
+        set_error("access_mask must be 0 for read, 1 for write, 2 for execute, or 3 for read_write");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    TTD::Replay::MemoryWatchpointData const watchpoint{
+        static_cast<TTD::GuestAddress>(address),
+        static_cast<uint64_t>(size),
+        native_access_mask,
+        TTD::Replay::UniqueThreadId::Invalid,
+    };
+
+    std::scoped_lock lock(cursor->trace->mutex);
+    if (!cursor->cursor->AddMemoryWatchpoint(watchpoint)) {
+        set_error("failed to add memory watchpoint");
+        return TTD_MCP_ERROR;
+    }
+
+    TTD::Replay::ICursorView::ReplayResult const replay_result = direction == 0
+        ? cursor->cursor->ReplayForward(TTD::Replay::StepCount::Max)
+        : cursor->cursor->ReplayBackward(TTD::Replay::StepCount::Max);
+
+    bool const removed = cursor->cursor->RemoveMemoryWatchpoint(watchpoint);
+    if (!removed) {
+        set_error("failed to remove memory watchpoint");
+        return TTD_MCP_ERROR;
+    }
+
+    TTD::Replay::ThreadInfo const& thread = cursor->cursor->GetThreadInfo();
+    bool const found = replay_result.StopReason == TTD::Replay::EventType::MemoryWatchpoint;
+    *result = TtdMcpMemoryWatchpointResult{
+        to_bridge_position(cursor->cursor->GetPosition()),
+        to_bridge_position(cursor->cursor->GetPreviousPosition()),
+        static_cast<uint32_t>(replay_result.StopReason),
+        found ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0),
+        static_cast<uint64_t>(thread.UniqueId),
+        static_cast<uint32_t>(thread.Id),
+        static_cast<uint64_t>(cursor->cursor->GetProgramCounter()),
+        found ? static_cast<uint64_t>(replay_result.MemoryWatchpoint.Address) : 0,
+        found ? replay_result.MemoryWatchpoint.Size : 0,
+        found ? static_cast<uint32_t>(replay_result.MemoryWatchpoint.AccessType) : 0,
+    };
+    return TTD_MCP_OK;
+}
 #else
 struct TtdMcpTrace {};
 struct TtdMcpCursor {};
@@ -431,6 +561,16 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_read_memory(TtdMcpCursor*, uint64_t, uint8_t
 }
 
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_cursor_state(TtdMcpCursor*, TtdMcpCursorState*) {
+    set_error("TTD replay bridge is not implemented in this build");
+    return TTD_MCP_NOT_IMPLEMENTED;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_step_cursor(TtdMcpCursor*, uint32_t, uint32_t, uint8_t, TtdMcpStepResult*) {
+    set_error("TTD replay bridge is not implemented in this build");
+    return TTD_MCP_NOT_IMPLEMENTED;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_memory_watchpoint(TtdMcpCursor*, uint64_t, uint32_t, uint32_t, uint32_t, TtdMcpMemoryWatchpointResult*) {
     set_error("TTD replay bridge is not implemented in this build");
     return TTD_MCP_NOT_IMPLEMENTED;
 }

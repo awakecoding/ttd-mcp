@@ -1,0 +1,10 @@
+{
+	"servers": {
+		"ttd-mcp": {
+			"type": "stdio",
+			"command": "D:\\\\dev\\\\ttd-mcp\\\\target\\\\release\\\\ttd-mcp.exe",
+			"args": []
+		}
+	},
+	"inputs": []
+}

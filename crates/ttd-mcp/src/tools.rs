@@ -1,6 +1,7 @@
 use crate::ttd_replay::{
-    CursorId, LoadTraceRequest, MemoryAccessDirection, MemoryWatchpointRequest, Position,
-    PositionRequest, ReadMemoryRequest, SessionId, SessionRegistry, StepRequest,
+    AddressInfoRequest, CursorId, LoadTraceRequest, MemoryAccessDirection, MemoryWatchpointRequest,
+    ModuleInfoRequest, Position, PositionRequest, ReadMemoryRequest, SessionId, SessionRegistry,
+    StackReadRequest, StepRequest,
 };
 use anyhow::{bail, Context};
 use rmcp::model::{JsonObject, Tool};
@@ -39,12 +40,24 @@ pub fn definitions() -> Vec<Tool> {
             "Return summary metadata for a loaded TTD trace.",
         ),
         tool::<SessionArg>(
+            "ttd_capabilities",
+            "Return backend features available for a loaded TTD trace session.",
+        ),
+        tool::<SessionArg>(
             "ttd_list_threads",
             "List threads captured in a loaded TTD trace.",
         ),
         tool::<SessionArg>(
             "ttd_list_modules",
             "List modules and module instances captured in a loaded TTD trace.",
+        ),
+        tool::<ModuleInfoRequest>(
+            "ttd_module_info",
+            "Find a loaded module by name or guest address.",
+        ),
+        tool::<AddressInfoRequest>(
+            "ttd_address_info",
+            "Translate a runtime address into module/RVA coordinates with current cursor context.",
         ),
         tool::<SessionArg>(
             "ttd_list_exceptions",
@@ -69,6 +82,14 @@ pub fn definitions() -> Vec<Tool> {
         tool::<CursorArg>(
             "ttd_registers",
             "Read core register and thread state at a replay cursor position.",
+        ),
+        tool::<CursorArg>(
+            "ttd_stack_info",
+            "Read current thread stack bounds and stack registers at a replay cursor position.",
+        ),
+        tool::<StackReadRequest>(
+            "ttd_stack_read",
+            "Read a bounded stack window around the current stack pointer.",
         ),
         tool::<CursorArg>(
             "ttd_command_line",
@@ -102,6 +123,12 @@ pub async fn call(registry: &mut SessionRegistry, call: ToolCall) -> anyhow::Res
                 registry.trace_info(request.session_id)?,
             )?)
         }
+        "ttd_capabilities" => {
+            let request = parse::<SessionArg>(call.arguments)?;
+            Ok(serde_json::to_value(
+                registry.capabilities(request.session_id)?,
+            )?)
+        }
         "ttd_list_threads" => {
             let request = parse::<SessionArg>(call.arguments)?;
             Ok(serde_json::to_value(
@@ -113,6 +140,14 @@ pub async fn call(registry: &mut SessionRegistry, call: ToolCall) -> anyhow::Res
             Ok(serde_json::to_value(
                 registry.list_modules(request.session_id)?,
             )?)
+        }
+        "ttd_module_info" => {
+            let request = parse::<ModuleInfoRequest>(call.arguments)?;
+            Ok(serde_json::to_value(registry.module_info(request)?)?)
+        }
+        "ttd_address_info" => {
+            let request = parse::<AddressInfoRequest>(call.arguments)?;
+            Ok(serde_json::to_value(registry.address_info(request)?)?)
         }
         "ttd_list_exceptions" => {
             let request = parse::<SessionArg>(call.arguments)?;
@@ -145,6 +180,16 @@ pub async fn call(registry: &mut SessionRegistry, call: ToolCall) -> anyhow::Res
             Ok(serde_json::to_value(
                 registry.registers(request.session_id, request.cursor_id)?,
             )?)
+        }
+        "ttd_stack_info" => {
+            let request = parse::<CursorArg>(call.arguments)?;
+            Ok(serde_json::to_value(
+                registry.stack_info(request.session_id, request.cursor_id)?,
+            )?)
+        }
+        "ttd_stack_read" => {
+            let request = parse::<StackReadRequest>(call.arguments)?;
+            Ok(serde_json::to_value(registry.stack_read(request)?)?)
         }
         "ttd_command_line" => {
             let request = parse::<CursorArg>(call.arguments)?;

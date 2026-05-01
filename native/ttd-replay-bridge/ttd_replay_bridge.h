@@ -89,6 +89,27 @@ typedef struct TtdMcpCursorState {
     uint64_t basic_return_value;
 } TtdMcpCursorState;
 
+typedef struct TtdMcpStepResult {
+    TtdMcpPosition position;
+    TtdMcpPosition previous_position;
+    uint32_t stop_reason;
+    uint64_t steps_executed;
+    uint64_t instructions_executed;
+} TtdMcpStepResult;
+
+typedef struct TtdMcpMemoryWatchpointResult {
+    TtdMcpPosition position;
+    TtdMcpPosition previous_position;
+    uint32_t stop_reason;
+    uint8_t found;
+    uint64_t thread_unique_id;
+    uint32_t thread_id;
+    uint64_t program_counter;
+    uint64_t match_address;
+    uint64_t match_size;
+    uint32_t match_access;
+} TtdMcpMemoryWatchpointResult;
+
 typedef enum TtdMcpStatus {
     TTD_MCP_OK = 0,
     TTD_MCP_ERROR = 1,
@@ -108,6 +129,8 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_cursor_position(TtdMcpCursor* cursor, TtdMcp
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_set_position(TtdMcpCursor* cursor, TtdMcpPosition position);
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_read_memory(TtdMcpCursor* cursor, uint64_t address, uint8_t* buffer, uint32_t capacity, TtdMcpMemoryRead* result);
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_cursor_state(TtdMcpCursor* cursor, TtdMcpCursorState* state);
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_step_cursor(TtdMcpCursor* cursor, uint32_t direction, uint32_t count, uint8_t only_current_thread, TtdMcpStepResult* result);
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_memory_watchpoint(TtdMcpCursor* cursor, uint64_t address, uint32_t size, uint32_t access_mask, uint32_t direction, TtdMcpMemoryWatchpointResult* result);
 TTD_MCP_EXPORT const char* ttd_mcp_last_error(void);
 
 #ifdef __cplusplus
