@@ -7,6 +7,7 @@
 #include <limits>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace {
 thread_local std::string g_last_error;
@@ -26,6 +27,7 @@ void set_error(char const* message) noexcept {
 
 #include <TTD/ErrorReporting.h>
 #include <TTD/IReplayEngineStl.h>
+#include <TTD/IReplayEngineRegisters.h>
 
 namespace {
 TtdMcpPosition to_bridge_position(TTD::Replay::Position const& position) noexcept {
@@ -47,6 +49,10 @@ TtdMcpPosition to_bridge_position(TTD::SequenceId sequence) noexcept {
 
 bool is_valid_sequence(TTD::SequenceId sequence) noexcept {
     return sequence != TTD::SequenceId::Invalid;
+}
+
+bool is_valid_position(TTD::Replay::Position const& position) noexcept {
+    return is_valid_sequence(position.Sequence);
 }
 
 void copy_wide(wchar_t* destination, size_t capacity, wchar_t const* source, size_t length) noexcept {
@@ -86,6 +92,40 @@ TtdMcpStatus set_required_count(size_t required, uint32_t* count) noexcept {
 
     *count = static_cast<uint32_t>(required);
     return TTD_MCP_OK;
+}
+
+TtdMcpThreadInfo to_bridge_thread(TTD::Replay::ThreadInfo const& thread) noexcept {
+    return TtdMcpThreadInfo{
+        static_cast<uint64_t>(thread.UniqueId),
+        static_cast<uint32_t>(thread.Id),
+        to_bridge_position(thread.Lifetime.Min),
+        to_bridge_position(thread.Lifetime.Max),
+        to_bridge_position(thread.ActiveTime.Min),
+        to_bridge_position(thread.ActiveTime.Max),
+        thread.ActiveTime.IsValid() ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0),
+    };
+}
+
+TtdMcpModuleInfo to_bridge_module(TTD::Replay::Module const* module) noexcept {
+    TtdMcpModuleInfo output = {};
+    if (module == nullptr) {
+        return output;
+    }
+
+    wchar_t const* const base_name = TTD::Replay::GetModuleBaseName(module->pName, module->NameLength);
+    size_t const base_name_length = module->NameLength - static_cast<size_t>(base_name - module->pName);
+    copy_wide(output.name, std::size(output.name), base_name, base_name_length);
+    copy_wide(output.path, std::size(output.path), module->pName, module->NameLength);
+    output.base_address = static_cast<uint64_t>(module->Address);
+    output.size = module->Size;
+    return output;
+}
+
+TtdMcpVector128 to_bridge_vector(M128BIT const& value) noexcept {
+    return TtdMcpVector128{
+        value.Low,
+        static_cast<uint64_t>(value.High),
+    };
 }
 
 bool to_data_access_mask(uint32_t value, TTD::Replay::DataAccessMask* access_mask) noexcept {
@@ -215,16 +255,7 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_threads(TtdMcpTrace* trace, TtdMcpThrea
 
     TTD::Replay::ThreadInfo const* const source = trace->engine->GetThreadList();
     for (size_t index = 0; index < required; ++index) {
-        TTD::Replay::ThreadInfo const& thread = source[index];
-        threads[index] = TtdMcpThreadInfo{
-            static_cast<uint64_t>(thread.UniqueId),
-            static_cast<uint32_t>(thread.Id),
-            to_bridge_position(thread.Lifetime.Min),
-            to_bridge_position(thread.Lifetime.Max),
-            to_bridge_position(thread.ActiveTime.Min),
-            to_bridge_position(thread.ActiveTime.Max),
-            thread.ActiveTime.IsValid() ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0),
-        };
+        threads[index] = to_bridge_thread(source[index]);
     }
 
     return TTD_MCP_OK;
@@ -250,18 +281,7 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_modules(TtdMcpTrace* trace, TtdMcpModul
     TTD::Replay::ModuleInstance const* const source = trace->engine->GetModuleInstanceList();
     for (size_t index = 0; index < required; ++index) {
         TTD::Replay::ModuleInstance const& instance = source[index];
-        TTD::Replay::Module const* const module = instance.pModule;
-        TtdMcpModuleInfo output = {};
-
-        if (module != nullptr) {
-            wchar_t const* const base_name = TTD::Replay::GetModuleBaseName(module->pName, module->NameLength);
-            size_t const base_name_length = module->NameLength - static_cast<size_t>(base_name - module->pName);
-            copy_wide(output.name, std::size(output.name), base_name, base_name_length);
-            copy_wide(output.path, std::size(output.path), module->pName, module->NameLength);
-            output.base_address = static_cast<uint64_t>(module->Address);
-            output.size = module->Size;
-        }
-
+        TtdMcpModuleInfo output = to_bridge_module(instance.pModule);
         output.load_position = to_bridge_position(instance.LoadTime);
         output.unload_position = to_bridge_position(instance.UnloadTime);
         output.has_unload_position = is_valid_sequence(instance.UnloadTime) ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
@@ -303,6 +323,122 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_exceptions(TtdMcpTrace* trace, TtdMcpEx
             output.parameters[parameter_index] = exception.Parameters[parameter_index];
         }
         exceptions[index] = output;
+    }
+
+    return TTD_MCP_OK;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_keyframes(TtdMcpTrace* trace, TtdMcpPosition* keyframes, uint32_t capacity, uint32_t* count) {
+    TtdMcpStatus const request_status = validate_list_request(trace, keyframes, capacity, count);
+    if (request_status != TTD_MCP_OK) {
+        return request_status;
+    }
+
+    std::scoped_lock lock(trace->mutex);
+    size_t const required = trace->engine->GetKeyframeCount();
+    TtdMcpStatus const count_status = set_required_count(required, count);
+    if (count_status != TTD_MCP_OK) {
+        return count_status;
+    }
+
+    if (capacity < required) {
+        return TTD_MCP_OK;
+    }
+
+    TTD::Replay::Position const* const source = trace->engine->GetKeyframeList();
+    for (size_t index = 0; index < required; ++index) {
+        keyframes[index] = to_bridge_position(source[index]);
+    }
+
+    return TTD_MCP_OK;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_module_events(TtdMcpTrace* trace, TtdMcpModuleEventInfo* events, uint32_t capacity, uint32_t* count) {
+    TtdMcpStatus const request_status = validate_list_request(trace, events, capacity, count);
+    if (request_status != TTD_MCP_OK) {
+        return request_status;
+    }
+
+    std::scoped_lock lock(trace->mutex);
+    size_t const loaded_count = trace->engine->GetModuleLoadedEventCount();
+    size_t const unloaded_count = trace->engine->GetModuleUnloadedEventCount();
+    size_t const required = loaded_count + unloaded_count;
+    TtdMcpStatus const count_status = set_required_count(required, count);
+    if (count_status != TTD_MCP_OK) {
+        return count_status;
+    }
+
+    if (capacity < required) {
+        return TTD_MCP_OK;
+    }
+
+    TTD::Replay::ModuleLoadedEvent const* const loaded = trace->engine->GetModuleLoadedEventList();
+    for (size_t index = 0; index < loaded_count; ++index) {
+        TTD::Replay::ModuleLoadedEvent const& event = loaded[index];
+        TtdMcpModuleEventInfo output = {};
+        output.kind = 0;
+        output.position = to_bridge_position(event.Position);
+        output.module = to_bridge_module(event.pModule);
+        output.module.load_position = output.position;
+        events[index] = output;
+    }
+
+    TTD::Replay::ModuleUnloadedEvent const* const unloaded = trace->engine->GetModuleUnloadedEventList();
+    for (size_t index = 0; index < unloaded_count; ++index) {
+        TTD::Replay::ModuleUnloadedEvent const& event = unloaded[index];
+        TtdMcpModuleEventInfo output = {};
+        output.kind = 1;
+        output.position = to_bridge_position(event.Position);
+        output.module = to_bridge_module(event.pModule);
+        output.module.unload_position = output.position;
+        output.module.has_unload_position = 1;
+        events[loaded_count + index] = output;
+    }
+
+    return TTD_MCP_OK;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_thread_events(TtdMcpTrace* trace, TtdMcpThreadEventInfo* events, uint32_t capacity, uint32_t* count) {
+    TtdMcpStatus const request_status = validate_list_request(trace, events, capacity, count);
+    if (request_status != TTD_MCP_OK) {
+        return request_status;
+    }
+
+    std::scoped_lock lock(trace->mutex);
+    size_t const created_count = trace->engine->GetThreadCreatedEventCount();
+    size_t const terminated_count = trace->engine->GetThreadTerminatedEventCount();
+    size_t const required = created_count + terminated_count;
+    TtdMcpStatus const count_status = set_required_count(required, count);
+    if (count_status != TTD_MCP_OK) {
+        return count_status;
+    }
+
+    if (capacity < required) {
+        return TTD_MCP_OK;
+    }
+
+    TTD::Replay::ThreadCreatedEvent const* const created = trace->engine->GetThreadCreatedEventList();
+    for (size_t index = 0; index < created_count; ++index) {
+        TTD::Replay::ThreadCreatedEvent const& event = created[index];
+        TtdMcpThreadEventInfo output = {};
+        output.kind = 0;
+        output.position = to_bridge_position(event.Position);
+        if (event.pThreadInfo != nullptr) {
+            output.thread = to_bridge_thread(*event.pThreadInfo);
+        }
+        events[index] = output;
+    }
+
+    TTD::Replay::ThreadTerminatedEvent const* const terminated = trace->engine->GetThreadTerminatedEventList();
+    for (size_t index = 0; index < terminated_count; ++index) {
+        TTD::Replay::ThreadTerminatedEvent const& event = terminated[index];
+        TtdMcpThreadEventInfo output = {};
+        output.kind = 1;
+        output.position = to_bridge_position(event.Position);
+        if (event.pThreadInfo != nullptr) {
+            output.thread = to_bridge_thread(*event.pThreadInfo);
+        }
+        events[created_count + index] = output;
     }
 
     return TTD_MCP_OK;
@@ -379,6 +515,105 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_read_memory(TtdMcpCursor* cursor, uint64_t a
     return TTD_MCP_OK;
 }
 
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_query_memory_range(TtdMcpCursor* cursor, uint64_t address, uint8_t* buffer, uint32_t capacity, TtdMcpMemoryRangeInfo* result) {
+    if (cursor == nullptr || result == nullptr) {
+        set_error("cursor and result pointers are required");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    if (address == 0) {
+        set_error("address must be non-zero");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    if (capacity > 0 && buffer == nullptr) {
+        set_error("buffer is required when capacity is non-zero");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    std::scoped_lock lock(cursor->trace->mutex);
+    auto const memory = cursor->cursor->QueryMemoryRange(static_cast<TTD::GuestAddress>(address));
+    size_t const bytes_available = memory.Memory.Size;
+    size_t const bytes_copied = std::min(static_cast<size_t>(capacity), bytes_available);
+    if (buffer != nullptr && memory.Memory.BaseAddress != nullptr && bytes_copied > 0) {
+        std::memmove(buffer, memory.Memory.BaseAddress, bytes_copied);
+    }
+
+    *result = TtdMcpMemoryRangeInfo{
+        static_cast<uint64_t>(memory.Address),
+        static_cast<uint64_t>(bytes_available),
+        static_cast<uint32_t>(bytes_copied),
+        static_cast<uint64_t>(memory.Sequence),
+        bytes_copied == bytes_available ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0),
+    };
+    return TTD_MCP_OK;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_query_memory_buffer_with_ranges(TtdMcpCursor* cursor, uint64_t address, uint8_t* buffer, uint32_t capacity, TtdMcpMemoryBufferRangeInfo* ranges, uint32_t range_capacity, TtdMcpMemoryBufferInfo* result) {
+    if (cursor == nullptr || buffer == nullptr || result == nullptr) {
+        set_error("cursor, buffer, and result pointers are required");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    if (capacity == 0) {
+        set_error("capacity must be greater than zero");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    if (address == 0) {
+        set_error("address must be non-zero");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    if (range_capacity == 0 || ranges == nullptr) {
+        set_error("at least one output range is required");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    std::scoped_lock lock(cursor->trace->mutex);
+    std::vector<TTD::Replay::MemoryRange> native_ranges(range_capacity);
+    auto const memory = cursor->cursor->QueryMemoryBufferWithRanges(
+        static_cast<TTD::GuestAddress>(address),
+        TTD::BufferView(buffer, capacity),
+        native_ranges.size(),
+        native_ranges.data());
+
+    size_t const bytes_read = std::min(static_cast<size_t>(capacity), memory.Memory.Size);
+    void const* const source = memory.Memory.BaseAddress;
+    if (source != nullptr && source != buffer && bytes_read > 0) {
+        std::memmove(buffer, source, bytes_read);
+    }
+
+    size_t const ranges_copied = std::min(memory.RangeCount, native_ranges.size());
+    for (size_t index = 0; index < ranges_copied; ++index) {
+        TTD::Replay::MemoryRange const& native_range = native_ranges[index];
+        uint64_t const range_address = static_cast<uint64_t>(native_range.Address);
+        uint32_t offset = 0;
+        if (range_address >= static_cast<uint64_t>(memory.Address)) {
+            uint64_t const delta = range_address - static_cast<uint64_t>(memory.Address);
+            offset = delta > std::numeric_limits<uint32_t>::max()
+                ? std::numeric_limits<uint32_t>::max()
+                : static_cast<uint32_t>(delta);
+        }
+        ranges[index] = TtdMcpMemoryBufferRangeInfo{
+            range_address,
+            static_cast<uint64_t>(native_range.Memory.Size),
+            static_cast<uint64_t>(native_range.Sequence),
+            offset,
+        };
+    }
+
+    *result = TtdMcpMemoryBufferInfo{
+        static_cast<uint64_t>(memory.Address),
+        static_cast<uint32_t>(bytes_read),
+        memory.RangeCount > std::numeric_limits<uint32_t>::max() ? std::numeric_limits<uint32_t>::max() : static_cast<uint32_t>(memory.RangeCount),
+        static_cast<uint32_t>(ranges_copied),
+        memory.Address == static_cast<TTD::GuestAddress>(address) && bytes_read == capacity ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0),
+        memory.RangeCount > native_ranges.size() ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0),
+    };
+    return TTD_MCP_OK;
+}
+
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_cursor_state(TtdMcpCursor* cursor, TtdMcpCursorState* state) {
     if (cursor == nullptr || state == nullptr) {
         set_error("cursor and state pointers are required");
@@ -398,6 +633,129 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_cursor_state(TtdMcpCursor* cursor, TtdMcpCur
         static_cast<uint64_t>(cursor->cursor->GetFramePointer()),
         cursor->cursor->GetBasicReturnValue(),
     };
+    return TTD_MCP_OK;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_x64_context(TtdMcpCursor* cursor, uint32_t thread_id, TtdMcpX64Context* context) {
+    if (cursor == nullptr || context == nullptr) {
+        set_error("cursor and context pointers are required");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    std::scoped_lock lock(cursor->trace->mutex);
+    TTD::ThreadId const native_thread_id = thread_id == 0
+        ? TTD::ThreadId::Invalid
+        : static_cast<TTD::ThreadId>(thread_id);
+    TTD::Replay::ThreadInfo const& thread = cursor->cursor->GetThreadInfo(native_thread_id);
+    CROSS_PLATFORM_CONTEXT const cross_platform = cursor->cursor->GetCrossPlatformContext(native_thread_id);
+    AVX_EXTENDED_CONTEXT const avx = cursor->cursor->GetAvxExtendedContext(native_thread_id);
+    AMD64_CONTEXT const& amd64 = cross_platform.Amd64Context;
+
+    TtdMcpX64Context output = TtdMcpX64Context{
+        to_bridge_position(cursor->cursor->GetPosition(native_thread_id)),
+        to_bridge_position(cursor->cursor->GetPreviousPosition(native_thread_id)),
+        static_cast<uint64_t>(thread.UniqueId),
+        static_cast<uint32_t>(thread.Id),
+        static_cast<uint64_t>(cursor->cursor->GetTebAddress(native_thread_id)),
+        amd64.ContextFlags,
+        amd64.MxCsr,
+        amd64.SegCs,
+        amd64.SegDs,
+        amd64.SegEs,
+        amd64.SegFs,
+        amd64.SegGs,
+        amd64.SegSs,
+        amd64.EFlags,
+        amd64.Dr0,
+        amd64.Dr1,
+        amd64.Dr2,
+        amd64.Dr3,
+        amd64.Dr6,
+        amd64.Dr7,
+        amd64.Rax,
+        amd64.Rcx,
+        amd64.Rdx,
+        amd64.Rbx,
+        amd64.Rsp,
+        amd64.Rbp,
+        amd64.Rsi,
+        amd64.Rdi,
+        amd64.R8,
+        amd64.R9,
+        amd64.R10,
+        amd64.R11,
+        amd64.R12,
+        amd64.R13,
+        amd64.R14,
+        amd64.R15,
+        amd64.Rip,
+        amd64.VectorControl,
+        amd64.DebugControl,
+        amd64.LastBranchToRip,
+        amd64.LastBranchFromRip,
+        amd64.LastExceptionToRip,
+        amd64.LastExceptionFromRip,
+    };
+
+    for (size_t index = 0; index < std::size(output.xmm); ++index) {
+        output.xmm[index] = to_bridge_vector(amd64.FltSave.XmmRegisters[index]);
+    }
+
+    M128BIT const* const ymm_high = &avx.YmmRegisters.HighPart.Ymm0;
+    for (size_t index = 0; index < std::size(output.ymm_high); ++index) {
+        output.ymm_high[index] = to_bridge_vector(ymm_high[index]);
+    }
+
+    *context = output;
+    return TTD_MCP_OK;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_active_threads(TtdMcpCursor* cursor, TtdMcpActiveThreadInfo* threads, uint32_t capacity, uint32_t* count) {
+    if (cursor == nullptr || count == nullptr) {
+        set_error("cursor and count pointers are required");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    if (capacity > 0 && threads == nullptr) {
+        set_error("output buffer is required when capacity is non-zero");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    std::scoped_lock lock(cursor->trace->mutex);
+    size_t const required = cursor->cursor->GetThreadCount();
+    TtdMcpStatus const count_status = set_required_count(required, count);
+    if (count_status != TTD_MCP_OK) {
+        return count_status;
+    }
+
+    if (capacity < required) {
+        return TTD_MCP_OK;
+    }
+
+    TTD::Replay::ActiveThreadInfo const* const source = cursor->cursor->GetThreadList();
+    for (size_t index = 0; index < required; ++index) {
+        TTD::Replay::ActiveThreadInfo const& active = source[index];
+        TtdMcpActiveThreadInfo output = {};
+        output.current_position = to_bridge_position(active.CurrentPosition);
+        output.last_valid_position = to_bridge_position(active.LastValidPosition);
+        output.has_last_valid_position = is_valid_position(active.LastValidPosition) ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+
+        if (active.pThread != nullptr) {
+            output.thread = to_bridge_thread(*active.pThread);
+            TTD::ThreadId const thread_id = active.pThread->Id;
+            TTD::Replay::Position const& previous_position = cursor->cursor->GetPreviousPosition(thread_id);
+            output.previous_position = to_bridge_position(previous_position);
+            output.has_previous_position = is_valid_position(previous_position) ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+            output.teb_address = static_cast<uint64_t>(cursor->cursor->GetTebAddress(thread_id));
+            output.program_counter = static_cast<uint64_t>(cursor->cursor->GetProgramCounter(thread_id));
+            output.stack_pointer = static_cast<uint64_t>(cursor->cursor->GetStackPointer(thread_id));
+            output.frame_pointer = static_cast<uint64_t>(cursor->cursor->GetFramePointer(thread_id));
+            output.basic_return_value = cursor->cursor->GetBasicReturnValue(thread_id);
+        }
+
+        threads[index] = output;
+    }
+
     return TTD_MCP_OK;
 }
 
@@ -538,6 +896,21 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_exceptions(TtdMcpTrace*, TtdMcpExceptio
     return TTD_MCP_NOT_IMPLEMENTED;
 }
 
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_keyframes(TtdMcpTrace*, TtdMcpPosition*, uint32_t, uint32_t*) {
+    set_error("TTD replay bridge is not implemented in this build");
+    return TTD_MCP_NOT_IMPLEMENTED;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_module_events(TtdMcpTrace*, TtdMcpModuleEventInfo*, uint32_t, uint32_t*) {
+    set_error("TTD replay bridge is not implemented in this build");
+    return TTD_MCP_NOT_IMPLEMENTED;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_thread_events(TtdMcpTrace*, TtdMcpThreadEventInfo*, uint32_t, uint32_t*) {
+    set_error("TTD replay bridge is not implemented in this build");
+    return TTD_MCP_NOT_IMPLEMENTED;
+}
+
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_new_cursor(TtdMcpTrace*, TtdMcpCursor**) {
     set_error("TTD replay bridge is not implemented in this build");
     return TTD_MCP_NOT_IMPLEMENTED;
@@ -560,7 +933,27 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_read_memory(TtdMcpCursor*, uint64_t, uint8_t
     return TTD_MCP_NOT_IMPLEMENTED;
 }
 
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_query_memory_range(TtdMcpCursor*, uint64_t, uint8_t*, uint32_t, TtdMcpMemoryRangeInfo*) {
+    set_error("TTD replay bridge is not implemented in this build");
+    return TTD_MCP_NOT_IMPLEMENTED;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_query_memory_buffer_with_ranges(TtdMcpCursor*, uint64_t, uint8_t*, uint32_t, TtdMcpMemoryBufferRangeInfo*, uint32_t, TtdMcpMemoryBufferInfo*) {
+    set_error("TTD replay bridge is not implemented in this build");
+    return TTD_MCP_NOT_IMPLEMENTED;
+}
+
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_cursor_state(TtdMcpCursor*, TtdMcpCursorState*) {
+    set_error("TTD replay bridge is not implemented in this build");
+    return TTD_MCP_NOT_IMPLEMENTED;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_x64_context(TtdMcpCursor*, uint32_t, TtdMcpX64Context*) {
+    set_error("TTD replay bridge is not implemented in this build");
+    return TTD_MCP_NOT_IMPLEMENTED;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_active_threads(TtdMcpCursor*, TtdMcpActiveThreadInfo*, uint32_t, uint32_t*) {
     set_error("TTD replay bridge is not implemented in this build");
     return TTD_MCP_NOT_IMPLEMENTED;
 }

@@ -14,7 +14,7 @@ This repository contains the first implementation slice:
 - A C ABI C++ bridge scaffold for the TTD Replay API.
 - Dependency/runtime acquisition scripts and architecture docs.
 
-The native bridge now builds with CMake and the Rust facade uses it when available for trace loading, trace metadata, thread/module/exception enumeration, cursor creation, position get/set, forward/backward stepping, core cursor register/thread state, bounded memory reads, memory watchpoint replay, and trace-derived command-line extraction from PEB process parameters.
+The native bridge now builds with CMake and the Rust facade uses it when available for trace loading, trace metadata, thread/module/exception/keyframe enumeration, module and thread lifecycle event timelines, cursor creation, position get/set, active-thread snapshots, forward/backward stepping, compact and x64 scalar/SIMD cursor register/thread state, bounded memory reads, trace-backed memory range and buffer provenance queries, memory watchpoint replay, and trace-derived command-line extraction from PEB process parameters.
 
 ## Build
 
@@ -119,6 +119,9 @@ If `symbol_paths` does not already include the Microsoft public symbol server, t
 | --- | --- | --- |
 | `ttd_list_threads` | `session_id` | Lists trace threads with unique TTD thread id, OS thread id, lifetime positions, and active-time positions when available. Requires the native replay backend for non-empty results. |
 | `ttd_list_modules` | `session_id` | Lists module instances with name, path, base address, size, load position, and unload position when available. Requires the native replay backend for module data. |
+| `ttd_list_keyframes` | `session_id` | Lists replay keyframe positions captured in the trace. Requires the native replay backend for non-empty results. |
+| `ttd_module_events` | `session_id` | Lists module load and unload events with event position and module identity. Requires the native replay backend for non-empty results. |
+| `ttd_thread_events` | `session_id` | Lists thread create and terminate events with event position and thread identity/lifetime data. Requires the native replay backend for non-empty results. |
 | `ttd_list_exceptions` | `session_id` | Lists exception events with position, thread unique id, exception code/flags, program counter, record address, and parameters. Requires the native replay backend for non-empty results. |
 
 ### Cursor And Navigation Tools
@@ -129,6 +132,7 @@ If `symbol_paths` does not already include the Microsoft public symbol server, t
 | `ttd_position_get` | `session_id`, `cursor_id` | Returns the current cursor position. |
 | `ttd_position_set` | `session_id`, `cursor_id`, `position` | Moves the cursor to a position object, `HEX:HEX` string, or approximate lifetime percentage. |
 | `ttd_step` | `session_id`, `cursor_id`; optional `direction`, `kind`, `count` | Replays the cursor forward or backward and returns the new position, previous position, requested count, executed step/instruction counts, and stop reason. Requires the native replay backend. |
+| `ttd_active_threads` | `session_id`, `cursor_id` | Lists threads active at the cursor position with per-thread positions, PC/SP/FP/TEB state, and module/RVA coordinates for each runtime PC when available. Requires the native replay backend. |
 
 `ttd_step` defaults to:
 
@@ -147,11 +151,14 @@ If `symbol_paths` does not already include the Microsoft public symbol server, t
 | Tool | Arguments | Result |
 | --- | --- | --- |
 | `ttd_registers` | `session_id`, `cursor_id` | Returns compact cursor state: position, previous position, current thread ids, TEB address, program counter, stack pointer, frame pointer, and basic return value. Requires the native replay backend. |
+| `ttd_register_context` | `session_id`, `cursor_id`; optional `thread_id` | Returns x64 register context from TTD `GetCrossPlatformContext` and `GetAvxExtendedContext`, including control, segment, debug, general-purpose, XMM/YMM vector registers, branch/exception RIP fields, current thread identity, TEB, and module/RVA coordinates for RIP. Requires the native replay backend. |
 | `ttd_command_line` | `session_id`, `cursor_id` | Reads the process command line by following the PEB process-parameters pointers at the cursor position. Requires x64 PEB layout assumptions and the native replay backend. |
 | `ttd_read_memory` | `session_id`, `cursor_id`, `address`, `size` | Reads guest memory at the cursor position and returns the requested address/size, actual address, byte count, completeness flag, and lowercase hex data. Requires the native replay backend. |
+| `ttd_memory_range` | `session_id`, `cursor_id`, `address`; optional `max_bytes` | Queries the trace-backed contiguous memory range containing or following a guest address, returning the range address, source sequence, available byte count, bounded hex bytes, and module/RVA coordinates when available. Requires the native replay backend. |
+| `ttd_memory_buffer` | `session_id`, `cursor_id`, `address`, `size`; optional `max_ranges` | Reads guest memory at the cursor position and returns lowercase hex data plus per-subrange source sequences, buffer offsets, and module/RVA coordinates for correlating runtime bytes with static analysis tools. Requires the native replay backend. |
 | `ttd_memory_watchpoint` | `session_id`, `cursor_id`, `address`, `size`, `access`, `direction` | Finds the previous or next read/write/execute access to a guest memory range, moves the cursor to the replay stop position, and returns hit details when found. Requires the native replay backend. |
 
-`ttd_read_memory` requires `address` to be non-zero and `size` to be between `1` and `65536` bytes. `ttd_memory_watchpoint` requires a non-zero `address` and non-zero `size`, accepts `access` values `"read"`, `"write"`, `"execute"`, or `"read_write"`, and accepts `direction` values `"previous"` or `"next"`. A successful watchpoint response with `"found": false` means replay reached a trace boundary or other stop before a matching access; it is not a tool error.
+`ttd_register_context` defaults to the cursor's current thread; pass an active OS `thread_id` from `ttd_active_threads` to inspect another live thread at the same cursor position. XMM values are 16-byte little-endian hex strings, and YMM values are reconstructed as 32-byte little-endian hex strings from the lower XMM state plus the AVX high half. `ttd_read_memory` and `ttd_memory_buffer` require `address` to be non-zero and `size` to be between `1` and `65536` bytes. `ttd_memory_buffer` defaults to `64` source ranges and accepts up to `1024`. `ttd_memory_range` requires `address` to be non-zero and limits `max_bytes` to `65536`; set `max_bytes` to `0` to request provenance without returning bytes. `ttd_memory_watchpoint` requires a non-zero `address` and non-zero `size`, accepts `access` values `"read"`, `"write"`, `"execute"`, or `"read_write"`, and accepts `direction` values `"previous"` or `"next"`. A successful watchpoint response with `"found": false` means replay reached a trace boundary or other stop before a matching access; it is not a tool error.
 
 ### Example Tool Calls
 

@@ -1,7 +1,8 @@
 use crate::ttd_replay::{
-    AddressInfoRequest, CursorId, LoadTraceRequest, MemoryAccessDirection, MemoryWatchpointRequest,
-    ModuleInfoRequest, Position, PositionRequest, ReadMemoryRequest, SessionId, SessionRegistry,
-    StackReadRequest, StepRequest,
+    AddressInfoRequest, CursorId, LoadTraceRequest, MemoryAccessDirection, MemoryBufferRequest,
+    MemoryRangeRequest, MemoryWatchpointRequest, ModuleInfoRequest, Position, PositionRequest,
+    ReadMemoryRequest, RegisterContextRequest, SessionId, SessionRegistry, StackReadRequest,
+    StepRequest,
 };
 use anyhow::{bail, Context};
 use rmcp::model::{JsonObject, Tool};
@@ -51,6 +52,18 @@ pub fn definitions() -> Vec<Tool> {
             "ttd_list_modules",
             "List modules and module instances captured in a loaded TTD trace.",
         ),
+        tool::<SessionArg>(
+            "ttd_list_keyframes",
+            "List replay keyframe positions captured in a loaded TTD trace.",
+        ),
+        tool::<SessionArg>(
+            "ttd_module_events",
+            "List module load and unload events captured in a loaded TTD trace.",
+        ),
+        tool::<SessionArg>(
+            "ttd_thread_events",
+            "List thread create and terminate events captured in a loaded TTD trace.",
+        ),
         tool::<ModuleInfoRequest>(
             "ttd_module_info",
             "Find a loaded module by name or guest address.",
@@ -58,6 +71,10 @@ pub fn definitions() -> Vec<Tool> {
         tool::<AddressInfoRequest>(
             "ttd_address_info",
             "Translate a runtime address into module/RVA coordinates with current cursor context.",
+        ),
+        tool::<CursorArg>(
+            "ttd_active_threads",
+            "List active threads at a replay cursor position with runtime PCs and module/RVA coordinates.",
         ),
         tool::<SessionArg>(
             "ttd_list_exceptions",
@@ -83,6 +100,10 @@ pub fn definitions() -> Vec<Tool> {
             "ttd_registers",
             "Read core register and thread state at a replay cursor position.",
         ),
+        tool::<RegisterContextRequest>(
+            "ttd_register_context",
+            "Read x64 scalar and SIMD/vector register context at a replay cursor position.",
+        ),
         tool::<CursorArg>(
             "ttd_stack_info",
             "Read current thread stack bounds and stack registers at a replay cursor position.",
@@ -98,6 +119,14 @@ pub fn definitions() -> Vec<Tool> {
         tool::<ReadMemoryRequest>(
             "ttd_read_memory",
             "Read guest memory at a replay cursor position.",
+        ),
+        tool::<MemoryRangeRequest>(
+            "ttd_memory_range",
+            "Query the trace-backed contiguous memory range and provenance for a guest address.",
+        ),
+        tool::<MemoryBufferRequest>(
+            "ttd_memory_buffer",
+            "Read guest memory with per-subrange trace provenance for decompiler correlation.",
         ),
         tool::<MemoryWatchpointRequest>(
             "ttd_memory_watchpoint",
@@ -141,6 +170,24 @@ pub async fn call(registry: &mut SessionRegistry, call: ToolCall) -> anyhow::Res
                 registry.list_modules(request.session_id)?,
             )?)
         }
+        "ttd_list_keyframes" => {
+            let request = parse::<SessionArg>(call.arguments)?;
+            Ok(serde_json::to_value(
+                registry.list_keyframes(request.session_id)?,
+            )?)
+        }
+        "ttd_module_events" => {
+            let request = parse::<SessionArg>(call.arguments)?;
+            Ok(serde_json::to_value(
+                registry.list_module_events(request.session_id)?,
+            )?)
+        }
+        "ttd_thread_events" => {
+            let request = parse::<SessionArg>(call.arguments)?;
+            Ok(serde_json::to_value(
+                registry.list_thread_events(request.session_id)?,
+            )?)
+        }
         "ttd_module_info" => {
             let request = parse::<ModuleInfoRequest>(call.arguments)?;
             Ok(serde_json::to_value(registry.module_info(request)?)?)
@@ -148,6 +195,12 @@ pub async fn call(registry: &mut SessionRegistry, call: ToolCall) -> anyhow::Res
         "ttd_address_info" => {
             let request = parse::<AddressInfoRequest>(call.arguments)?;
             Ok(serde_json::to_value(registry.address_info(request)?)?)
+        }
+        "ttd_active_threads" => {
+            let request = parse::<CursorArg>(call.arguments)?;
+            Ok(serde_json::to_value(
+                registry.active_threads(request.session_id, request.cursor_id)?,
+            )?)
         }
         "ttd_list_exceptions" => {
             let request = parse::<SessionArg>(call.arguments)?;
@@ -181,6 +234,10 @@ pub async fn call(registry: &mut SessionRegistry, call: ToolCall) -> anyhow::Res
                 registry.registers(request.session_id, request.cursor_id)?,
             )?)
         }
+        "ttd_register_context" => {
+            let request = parse::<RegisterContextRequest>(call.arguments)?;
+            Ok(serde_json::to_value(registry.register_context(request)?)?)
+        }
         "ttd_stack_info" => {
             let request = parse::<CursorArg>(call.arguments)?;
             Ok(serde_json::to_value(
@@ -200,6 +257,14 @@ pub async fn call(registry: &mut SessionRegistry, call: ToolCall) -> anyhow::Res
         "ttd_read_memory" => {
             let request = parse::<ReadMemoryRequest>(call.arguments)?;
             Ok(serde_json::to_value(registry.read_memory(request)?)?)
+        }
+        "ttd_memory_range" => {
+            let request = parse::<MemoryRangeRequest>(call.arguments)?;
+            Ok(serde_json::to_value(registry.memory_range(request)?)?)
+        }
+        "ttd_memory_buffer" => {
+            let request = parse::<MemoryBufferRequest>(call.arguments)?;
+            Ok(serde_json::to_value(registry.memory_buffer(request)?)?)
         }
         "ttd_memory_watchpoint" => {
             let request = parse::<MemoryWatchpointRequest>(call.arguments)?;

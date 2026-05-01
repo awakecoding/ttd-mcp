@@ -8,12 +8,16 @@ pub use position::{Position, PositionOrPercent};
 pub use registry::{CursorId, SessionId, SessionRegistry};
 pub use symbols::{ResolvedSymbolConfig, SymbolSettings};
 pub use types::{
-    AddressClassification, AddressInfoRequest, AddressInfoResponse, AddressModuleCoordinate,
-    AddressRegisterContext, AddressStackContext, CapabilitiesResponse, CursorPosition,
-    CursorRegisters, CursorThreadState, LoadTraceRequest, LoadTraceResponse, MemoryAccessDirection,
-    MemoryAccessKind, MemoryAccessMask, MemoryWatchpointRequest, MemoryWatchpointResponse,
-    ModuleInfoRequest, ModuleInfoResponse, ModuleList, PositionRequest, ProcessCommandLine,
-    ReadMemoryRequest, ReadMemoryResponse, ReplayCapabilities, StackInfo, StackPointerValue,
-    StackReadRequest, StackReadResponse, StepDirection, StepKind, StepRequest, StepResult,
-    TraceException, TraceInfo, TraceModule, TraceThread,
+    ActiveThreadList, ActiveThreadState, AddressClassification, AddressInfoRequest,
+    AddressInfoResponse, AddressModuleCoordinate, AddressRegisterContext, AddressStackContext,
+    CapabilitiesResponse, CursorPosition, CursorRegisters, CursorThreadState, KeyframeList,
+    LoadTraceRequest, LoadTraceResponse, MemoryAccessDirection, MemoryAccessKind, MemoryAccessMask,
+    MemoryBufferRange, MemoryBufferRequest, MemoryBufferResponse, MemoryRangeRequest,
+    MemoryRangeResponse, MemoryWatchpointRequest, MemoryWatchpointResponse, ModuleEventKind,
+    ModuleEventList, ModuleInfoRequest, ModuleInfoResponse, ModuleList, PositionRequest,
+    ProcessCommandLine, ReadMemoryRequest, ReadMemoryResponse, RegisterContextRequest,
+    RegisterContextResponse, ReplayCapabilities, StackInfo, StackPointerValue, StackReadRequest,
+    StackReadResponse, StepDirection, StepKind, StepRequest, StepResult, ThreadEventKind,
+    ThreadEventList, TraceException, TraceInfo, TraceModule, TraceModuleEvent, TraceThread,
+    TraceThreadEvent, VectorRegister128, VectorRegister256, X64RegisterSet,
 };

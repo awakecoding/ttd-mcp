@@ -6,8 +6,9 @@ use common::{
 };
 use ttd_mcp::ttd_replay::{
     AddressClassification, AddressInfoRequest, LoadTraceRequest, MemoryAccessDirection,
-    MemoryAccessMask, MemoryWatchpointRequest, ModuleInfoRequest, Position, PositionOrPercent,
-    PositionRequest, ReadMemoryRequest, SessionRegistry, StackReadRequest, StepDirection, StepKind,
+    MemoryAccessMask, MemoryBufferRequest, MemoryRangeRequest, MemoryWatchpointRequest,
+    ModuleInfoRequest, Position, PositionOrPercent, PositionRequest, ReadMemoryRequest,
+    RegisterContextRequest, SessionRegistry, StackReadRequest, StepDirection, StepKind,
     StepRequest, TraceInfo,
 };
 
@@ -116,19 +117,36 @@ fn loads_ping_trace_fixture_and_exercises_cursor_path() -> anyhow::Result<()> {
             "native replay should advertise memory read and watchpoint support"
         );
         ensure!(
+            capabilities.features.full_registers && capabilities.features.avx_registers,
+            "native replay should advertise scalar and AVX/SIMD register context support"
+        );
+        ensure!(
             capabilities.features.module_info
                 && capabilities.features.address_info
+                && capabilities.features.list_keyframes
+                && capabilities.features.module_events
+                && capabilities.features.thread_events
+                && capabilities.features.active_threads
                 && capabilities.features.stack_info
                 && capabilities.features.stack_read,
-            "native replay should advertise address, module, and stack helper support"
+            "native replay should advertise address, module, event, keyframe, active thread, and stack helper support"
+        );
+        ensure!(
+            capabilities.features.memory_range && capabilities.features.memory_buffer_ranges,
+            "native replay should advertise trace-backed memory range and buffer provenance support"
         );
         assert_native_lists(&registry, loaded.session_id, &info)?;
+        assert_native_timeline_lists(&registry, loaded.session_id, &info)?;
         assert_native_module_info(&registry, loaded.session_id)?;
         assert_native_address_info(&registry, loaded.session_id, cursor.cursor_id)?;
+        assert_native_active_threads(&registry, loaded.session_id, cursor.cursor_id, &info)?;
         assert_native_registers(&registry, loaded.session_id, cursor.cursor_id)?;
+        assert_native_register_context(&registry, loaded.session_id, cursor.cursor_id)?;
         assert_native_stack_helpers(&registry, loaded.session_id, cursor.cursor_id)?;
         assert_native_step(&mut registry, loaded.session_id, cursor.cursor_id, &info)?;
         assert_native_memory_read(&registry, loaded.session_id, cursor.cursor_id, &info)?;
+        assert_native_memory_range(&registry, loaded.session_id, cursor.cursor_id)?;
+        assert_native_memory_buffer(&registry, loaded.session_id, cursor.cursor_id)?;
         assert_trace_command_line(&registry, loaded.session_id, cursor.cursor_id)?;
         assert_native_memory_watchpoint(&mut registry, loaded.session_id, cursor.cursor_id, &info)?;
     } else if info.backend != "ttd-replay-native" {
@@ -211,6 +229,59 @@ fn assert_native_lists(
     Ok(())
 }
 
+fn assert_native_timeline_lists(
+    registry: &SessionRegistry,
+    session_id: u64,
+    info: &TraceInfo,
+) -> anyhow::Result<()> {
+    let keyframes = registry.list_keyframes(session_id)?;
+    ensure!(
+        keyframes.keyframes.len() == info.keyframe_count.unwrap_or_default(),
+        "keyframe list count {} should match trace info {:?}",
+        keyframes.keyframes.len(),
+        info.keyframe_count
+    );
+    ensure!(
+        !keyframes.keyframes.is_empty(),
+        "native ping trace should include at least one keyframe"
+    );
+    for keyframe in &keyframes.keyframes {
+        assert_position_in_range(*keyframe, info.lifetime_start, info.lifetime_end);
+    }
+
+    let module_events = registry.list_module_events(session_id)?;
+    ensure!(
+        !module_events.events.is_empty(),
+        "native trace should include module lifecycle events"
+    );
+    ensure!(
+        module_events
+            .events
+            .iter()
+            .any(|event| event.module.name.eq_ignore_ascii_case("ping.exe")),
+        "module event list should include ping.exe lifecycle data"
+    );
+    for event in &module_events.events {
+        assert_position_in_range(event.position, info.lifetime_start, info.lifetime_end);
+    }
+
+    let thread_events = registry.list_thread_events(session_id)?;
+    ensure!(
+        !thread_events.events.is_empty(),
+        "native trace should include thread lifecycle events"
+    );
+    for event in &thread_events.events {
+        assert_position_in_range(event.position, info.lifetime_start, info.lifetime_end);
+        ensure!(
+            event.thread.unique_id != 0 || event.thread.thread_id != 0,
+            "thread lifecycle event should include thread identity: {:?}",
+            event
+        );
+    }
+
+    Ok(())
+}
+
 fn assert_native_registers(
     registry: &SessionRegistry,
     session_id: u64,
@@ -239,6 +310,81 @@ fn assert_native_registers(
         registers.stack_pointer != 0,
         "register snapshot should include a non-zero stack pointer"
     );
+
+    Ok(())
+}
+
+fn assert_native_register_context(
+    registry: &SessionRegistry,
+    session_id: u64,
+    cursor_id: u64,
+) -> anyhow::Result<()> {
+    let compact = registry.registers(session_id, cursor_id)?;
+    let context = registry.register_context(RegisterContextRequest {
+        session_id,
+        cursor_id,
+        thread_id: None,
+    })?;
+
+    ensure!(
+        context.position == compact.position,
+        "register_context position should match compact registers"
+    );
+    ensure!(
+        context.thread == compact.thread,
+        "register_context thread should match compact registers"
+    );
+    ensure!(
+        context.teb_address == compact.teb_address,
+        "register_context TEB should match compact registers"
+    );
+    ensure!(
+        context.architecture == "x64",
+        "register_context should report x64 architecture: {:?}",
+        context
+    );
+    ensure!(
+        context.registers.rip == compact.program_counter
+            && context.registers.rsp == compact.stack_pointer
+            && context.registers.rbp == compact.frame_pointer,
+        "register_context should match compact PC/SP/FP: {:?}",
+        context
+    );
+    ensure!(
+        context.registers.context_flags != 0 && context.registers.seg_cs != 0,
+        "register_context should include control/segment state: {:?}",
+        context
+    );
+    ensure!(
+        context.registers.xmm.len() == 16 && context.registers.ymm.len() == 16,
+        "register_context should include x64 XMM/YMM vector registers: {:?}",
+        context
+    );
+    ensure!(
+        context.registers.xmm[0].hex.len() == 32 && context.registers.ymm[0].hex.len() == 64,
+        "register_context should encode vector registers as lowercase hex bytes: {:?}",
+        context
+    );
+    ensure!(
+        context
+            .module
+            .as_ref()
+            .is_some_and(|coordinate| !coordinate.name.is_empty()),
+        "register_context should include RIP module coordinates when available: {:?}",
+        context
+    );
+
+    if let Some(thread) = context.thread.as_ref() {
+        let by_thread = registry.register_context(RegisterContextRequest {
+            session_id,
+            cursor_id,
+            thread_id: Some(thread.thread_id),
+        })?;
+        ensure!(
+            by_thread.thread == context.thread && by_thread.registers.rip == context.registers.rip,
+            "thread-specific register_context should match the current thread context"
+        );
+    }
 
     Ok(())
 }
@@ -334,6 +480,43 @@ fn assert_native_address_info(
     Ok(())
 }
 
+fn assert_native_active_threads(
+    registry: &SessionRegistry,
+    session_id: u64,
+    cursor_id: u64,
+    info: &TraceInfo,
+) -> anyhow::Result<()> {
+    let current = registry.cursor_position(session_id, cursor_id)?.position;
+    let active = registry.active_threads(session_id, cursor_id)?;
+    ensure!(
+        active.cursor_position == current,
+        "active thread response should echo current cursor position"
+    );
+    ensure!(
+        !active.threads.is_empty(),
+        "native trace should include at least one active thread at the cursor"
+    );
+    for thread in &active.threads {
+        assert_position_in_range(
+            thread.current_position,
+            info.lifetime_start,
+            info.lifetime_end,
+        );
+        ensure!(
+            thread.thread.unique_id != 0 || thread.thread.thread_id != 0,
+            "active thread should include identity: {:?}",
+            thread
+        );
+        ensure!(
+            thread.program_counter != 0 && thread.stack_pointer != 0,
+            "active thread should include runtime PC/SP: {:?}",
+            thread
+        );
+    }
+
+    Ok(())
+}
+
 fn assert_native_stack_helpers(
     registry: &SessionRegistry,
     session_id: u64,
@@ -409,6 +592,94 @@ fn assert_native_memory_read(
     ensure!(
         memory.data.len() == memory.bytes_read * 2,
         "hex payload length should match bytes read"
+    );
+
+    Ok(())
+}
+
+fn assert_native_memory_range(
+    registry: &SessionRegistry,
+    session_id: u64,
+    cursor_id: u64,
+) -> anyhow::Result<()> {
+    let module = registry.module_info(ModuleInfoRequest {
+        session_id,
+        name: Some("ping.exe".to_string()),
+        address: None,
+    })?;
+    let range = registry.memory_range(MemoryRangeRequest {
+        session_id,
+        cursor_id,
+        address: module.module.base_address,
+        max_bytes: 64,
+    })?;
+
+    ensure!(
+        range.range_address <= module.module.base_address,
+        "memory range should cover the requested module base: {:?}",
+        range
+    );
+    ensure!(
+        range.bytes_available > 0 && range.bytes_returned > 0,
+        "memory range should return trace-backed bytes: {:?}",
+        range
+    );
+    ensure!(
+        range.data.len() == range.bytes_returned * 2,
+        "memory range hex payload length should match returned bytes"
+    );
+    ensure!(
+        range
+            .module
+            .as_ref()
+            .is_some_and(|coordinate| coordinate.name.eq_ignore_ascii_case("ping.exe")),
+        "memory range should include ping.exe module coordinates: {:?}",
+        range
+    );
+
+    Ok(())
+}
+
+fn assert_native_memory_buffer(
+    registry: &SessionRegistry,
+    session_id: u64,
+    cursor_id: u64,
+) -> anyhow::Result<()> {
+    let module = registry.module_info(ModuleInfoRequest {
+        session_id,
+        name: Some("ping.exe".to_string()),
+        address: None,
+    })?;
+    let memory = registry.memory_buffer(MemoryBufferRequest {
+        session_id,
+        cursor_id,
+        address: module.module.base_address,
+        size: 64,
+        max_ranges: 8,
+    })?;
+
+    ensure!(
+        memory.address == module.module.base_address,
+        "memory buffer should start at requested module base: {:?}",
+        memory
+    );
+    ensure!(
+        memory.bytes_read > 0 && memory.data.len() == memory.bytes_read * 2,
+        "memory buffer should return hex bytes matching bytes_read: {:?}",
+        memory
+    );
+    ensure!(
+        !memory.ranges.is_empty(),
+        "memory buffer should include source ranges: {:?}",
+        memory
+    );
+    ensure!(
+        memory.ranges.iter().any(|range| range
+            .module
+            .as_ref()
+            .is_some_and(|coordinate| coordinate.name.eq_ignore_ascii_case("ping.exe"))),
+        "memory buffer ranges should include module/RVA coordinates for ping.exe: {:?}",
+        memory
     );
 
     Ok(())

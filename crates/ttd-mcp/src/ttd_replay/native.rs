@@ -1,7 +1,10 @@
 use super::types::{
-    CursorRegisters, CursorThreadState, MemoryAccessDirection, MemoryAccessKind, MemoryAccessMask,
-    MemoryWatchpointResponse, ReadMemoryResponse, StepDirection, StepKind, StepResult,
-    TraceException, TraceModule, TraceThread,
+    ActiveThreadState, CursorRegisters, CursorThreadState, MemoryAccessDirection, MemoryAccessKind,
+    MemoryAccessMask, MemoryBufferRange, MemoryBufferResponse, MemoryRangeResponse,
+    MemoryWatchpointResponse, ModuleEventKind, ReadMemoryResponse, RegisterContextResponse,
+    StepDirection, StepKind, StepResult, ThreadEventKind, TraceException, TraceModule,
+    TraceModuleEvent, TraceThread, TraceThreadEvent, VectorRegister128, VectorRegister256,
+    X64RegisterSet,
 };
 use super::{Position, ResolvedSymbolConfig};
 use anyhow::{bail, Context};
@@ -91,6 +94,22 @@ struct TtdMcpExceptionInfo {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+struct TtdMcpModuleEventInfo {
+    kind: u8,
+    position: TtdMcpPosition,
+    module: TtdMcpModuleInfo,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TtdMcpThreadEventInfo {
+    kind: u8,
+    position: TtdMcpPosition,
+    thread: TtdMcpThreadInfo,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct TtdMcpMemoryRead {
     address: u64,
     bytes_read: u32,
@@ -109,6 +128,109 @@ struct TtdMcpCursorState {
     stack_pointer: u64,
     frame_pointer: u64,
     basic_return_value: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TtdMcpVector128 {
+    low: u64,
+    high: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TtdMcpX64Context {
+    position: TtdMcpPosition,
+    previous_position: TtdMcpPosition,
+    thread_unique_id: u64,
+    thread_id: u32,
+    teb_address: u64,
+    context_flags: u32,
+    mx_csr: u32,
+    seg_cs: u16,
+    seg_ds: u16,
+    seg_es: u16,
+    seg_fs: u16,
+    seg_gs: u16,
+    seg_ss: u16,
+    eflags: u32,
+    dr0: u64,
+    dr1: u64,
+    dr2: u64,
+    dr3: u64,
+    dr6: u64,
+    dr7: u64,
+    rax: u64,
+    rcx: u64,
+    rdx: u64,
+    rbx: u64,
+    rsp: u64,
+    rbp: u64,
+    rsi: u64,
+    rdi: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rip: u64,
+    vector_control: u64,
+    debug_control: u64,
+    last_branch_to_rip: u64,
+    last_branch_from_rip: u64,
+    last_exception_to_rip: u64,
+    last_exception_from_rip: u64,
+    xmm: [TtdMcpVector128; 16],
+    ymm_high: [TtdMcpVector128; 16],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TtdMcpActiveThreadInfo {
+    thread: TtdMcpThreadInfo,
+    current_position: TtdMcpPosition,
+    last_valid_position: TtdMcpPosition,
+    previous_position: TtdMcpPosition,
+    has_last_valid_position: u8,
+    has_previous_position: u8,
+    teb_address: u64,
+    program_counter: u64,
+    stack_pointer: u64,
+    frame_pointer: u64,
+    basic_return_value: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TtdMcpMemoryRangeInfo {
+    address: u64,
+    bytes_available: u64,
+    bytes_copied: u32,
+    sequence: u64,
+    complete: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TtdMcpMemoryBufferInfo {
+    address: u64,
+    bytes_read: u32,
+    range_count: u32,
+    ranges_copied: u32,
+    complete: u8,
+    ranges_truncated: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TtdMcpMemoryBufferRangeInfo {
+    address: u64,
+    size: u64,
+    sequence: u64,
+    offset: u32,
 }
 
 #[repr(C)]
@@ -146,13 +268,33 @@ type ListModulesFn =
     unsafe extern "C" fn(*mut TtdMcpTrace, *mut TtdMcpModuleInfo, u32, *mut u32) -> i32;
 type ListExceptionsFn =
     unsafe extern "C" fn(*mut TtdMcpTrace, *mut TtdMcpExceptionInfo, u32, *mut u32) -> i32;
+type ListKeyframesFn =
+    unsafe extern "C" fn(*mut TtdMcpTrace, *mut TtdMcpPosition, u32, *mut u32) -> i32;
+type ListModuleEventsFn =
+    unsafe extern "C" fn(*mut TtdMcpTrace, *mut TtdMcpModuleEventInfo, u32, *mut u32) -> i32;
+type ListThreadEventsFn =
+    unsafe extern "C" fn(*mut TtdMcpTrace, *mut TtdMcpThreadEventInfo, u32, *mut u32) -> i32;
 type NewCursorFn = unsafe extern "C" fn(*mut TtdMcpTrace, *mut *mut TtdMcpCursor) -> i32;
 type FreeCursorFn = unsafe extern "C" fn(*mut TtdMcpCursor);
 type CursorPositionFn = unsafe extern "C" fn(*mut TtdMcpCursor, *mut TtdMcpPosition) -> i32;
 type SetPositionFn = unsafe extern "C" fn(*mut TtdMcpCursor, TtdMcpPosition) -> i32;
 type ReadMemoryFn =
     unsafe extern "C" fn(*mut TtdMcpCursor, u64, *mut u8, u32, *mut TtdMcpMemoryRead) -> i32;
+type QueryMemoryRangeFn =
+    unsafe extern "C" fn(*mut TtdMcpCursor, u64, *mut u8, u32, *mut TtdMcpMemoryRangeInfo) -> i32;
+type QueryMemoryBufferWithRangesFn = unsafe extern "C" fn(
+    *mut TtdMcpCursor,
+    u64,
+    *mut u8,
+    u32,
+    *mut TtdMcpMemoryBufferRangeInfo,
+    u32,
+    *mut TtdMcpMemoryBufferInfo,
+) -> i32;
 type CursorStateFn = unsafe extern "C" fn(*mut TtdMcpCursor, *mut TtdMcpCursorState) -> i32;
+type X64ContextFn = unsafe extern "C" fn(*mut TtdMcpCursor, u32, *mut TtdMcpX64Context) -> i32;
+type ActiveThreadsFn =
+    unsafe extern "C" fn(*mut TtdMcpCursor, *mut TtdMcpActiveThreadInfo, u32, *mut u32) -> i32;
 type StepCursorFn =
     unsafe extern "C" fn(*mut TtdMcpCursor, u32, u32, u8, *mut TtdMcpStepResult) -> i32;
 type MemoryWatchpointFn = unsafe extern "C" fn(
@@ -369,6 +511,66 @@ impl NativeTrace {
         exceptions.truncate(count as usize);
         Ok(exceptions.into_iter().map(TraceException::from).collect())
     }
+
+    pub fn list_keyframes(&self) -> anyhow::Result<Vec<Position>> {
+        let list_keyframes: Symbol<ListKeyframesFn> =
+            unsafe { self.bridge.symbol(b"ttd_mcp_list_keyframes\0")? };
+        let mut count = 0;
+        let status =
+            unsafe { list_keyframes(self.handle.as_ptr(), std::ptr::null_mut(), 0, &mut count) };
+        self.bridge.ensure_ok(status, "querying keyframe count")?;
+
+        let mut keyframes = vec![TtdMcpPosition::default(); count as usize];
+        let status = unsafe {
+            list_keyframes(
+                self.handle.as_ptr(),
+                keyframes.as_mut_ptr(),
+                count,
+                &mut count,
+            )
+        };
+        self.bridge.ensure_ok(status, "listing keyframes")?;
+        keyframes.truncate(count as usize);
+        Ok(keyframes.into_iter().map(Position::from).collect())
+    }
+
+    pub fn list_module_events(&self) -> anyhow::Result<Vec<TraceModuleEvent>> {
+        let list_module_events: Symbol<ListModuleEventsFn> =
+            unsafe { self.bridge.symbol(b"ttd_mcp_list_module_events\0")? };
+        let mut count = 0;
+        let status = unsafe {
+            list_module_events(self.handle.as_ptr(), std::ptr::null_mut(), 0, &mut count)
+        };
+        self.bridge
+            .ensure_ok(status, "querying module event count")?;
+
+        let mut events = vec![TtdMcpModuleEventInfo::default(); count as usize];
+        let status = unsafe {
+            list_module_events(self.handle.as_ptr(), events.as_mut_ptr(), count, &mut count)
+        };
+        self.bridge.ensure_ok(status, "listing module events")?;
+        events.truncate(count as usize);
+        Ok(events.into_iter().map(TraceModuleEvent::from).collect())
+    }
+
+    pub fn list_thread_events(&self) -> anyhow::Result<Vec<TraceThreadEvent>> {
+        let list_thread_events: Symbol<ListThreadEventsFn> =
+            unsafe { self.bridge.symbol(b"ttd_mcp_list_thread_events\0")? };
+        let mut count = 0;
+        let status = unsafe {
+            list_thread_events(self.handle.as_ptr(), std::ptr::null_mut(), 0, &mut count)
+        };
+        self.bridge
+            .ensure_ok(status, "querying thread event count")?;
+
+        let mut events = vec![TtdMcpThreadEventInfo::default(); count as usize];
+        let status = unsafe {
+            list_thread_events(self.handle.as_ptr(), events.as_mut_ptr(), count, &mut count)
+        };
+        self.bridge.ensure_ok(status, "listing thread events")?;
+        events.truncate(count as usize);
+        Ok(events.into_iter().map(TraceThreadEvent::from).collect())
+    }
 }
 
 impl Drop for NativeTrace {
@@ -438,6 +640,93 @@ impl NativeCursor {
         })
     }
 
+    pub fn memory_range(
+        &self,
+        session_id: u64,
+        cursor_id: u64,
+        address: u64,
+        max_bytes: u32,
+    ) -> anyhow::Result<MemoryRangeResponse> {
+        let query_memory_range: Symbol<QueryMemoryRangeFn> =
+            unsafe { self.bridge.symbol(b"ttd_mcp_query_memory_range\0")? };
+        let mut buffer = vec![0; max_bytes as usize];
+        let mut result = TtdMcpMemoryRangeInfo::default();
+        let status = unsafe {
+            query_memory_range(
+                self.handle.as_ptr(),
+                address,
+                buffer.as_mut_ptr(),
+                max_bytes,
+                &mut result,
+            )
+        };
+        self.bridge
+            .ensure_ok(status, "querying cursor memory range")?;
+
+        let bytes_returned = (result.bytes_copied as usize).min(buffer.len());
+        buffer.truncate(bytes_returned);
+        Ok(MemoryRangeResponse {
+            session_id,
+            cursor_id,
+            requested_address: address,
+            range_address: result.address,
+            sequence: result.sequence,
+            bytes_available: result.bytes_available,
+            bytes_returned,
+            complete: result.complete != 0,
+            encoding: "hex".to_string(),
+            data: bytes_to_hex(&buffer),
+            module: None,
+        })
+    }
+
+    pub fn memory_buffer_with_ranges(
+        &self,
+        session_id: u64,
+        cursor_id: u64,
+        address: u64,
+        size: u32,
+        max_ranges: u32,
+    ) -> anyhow::Result<MemoryBufferResponse> {
+        let query_memory_buffer_with_ranges: Symbol<QueryMemoryBufferWithRangesFn> = unsafe {
+            self.bridge
+                .symbol(b"ttd_mcp_query_memory_buffer_with_ranges\0")?
+        };
+        let mut buffer = vec![0; size as usize];
+        let mut ranges = vec![TtdMcpMemoryBufferRangeInfo::default(); max_ranges as usize];
+        let mut result = TtdMcpMemoryBufferInfo::default();
+        let status = unsafe {
+            query_memory_buffer_with_ranges(
+                self.handle.as_ptr(),
+                address,
+                buffer.as_mut_ptr(),
+                size,
+                ranges.as_mut_ptr(),
+                max_ranges,
+                &mut result,
+            )
+        };
+        self.bridge
+            .ensure_ok(status, "querying cursor memory buffer with ranges")?;
+
+        let bytes_read = (result.bytes_read as usize).min(buffer.len());
+        buffer.truncate(bytes_read);
+        ranges.truncate((result.ranges_copied as usize).min(ranges.len()));
+        Ok(MemoryBufferResponse {
+            session_id,
+            cursor_id,
+            requested_address: address,
+            requested_size: size,
+            address: result.address,
+            bytes_read,
+            complete: result.complete != 0,
+            ranges_truncated: result.ranges_truncated != 0,
+            encoding: "hex".to_string(),
+            data: bytes_to_hex(&buffer),
+            ranges: ranges.into_iter().map(MemoryBufferRange::from).collect(),
+        })
+    }
+
     pub fn registers(&self, session_id: u64, cursor_id: u64) -> anyhow::Result<CursorRegisters> {
         let cursor_state: Symbol<CursorStateFn> =
             unsafe { self.bridge.symbol(b"ttd_mcp_cursor_state\0")? };
@@ -463,6 +752,66 @@ impl NativeCursor {
             frame_pointer: state.frame_pointer,
             basic_return_value: state.basic_return_value,
         })
+    }
+
+    pub fn x64_context(
+        &self,
+        session_id: u64,
+        cursor_id: u64,
+        thread_id: Option<u32>,
+    ) -> anyhow::Result<RegisterContextResponse> {
+        let x64_context: Symbol<X64ContextFn> =
+            unsafe { self.bridge.symbol(b"ttd_mcp_x64_context\0")? };
+        let mut context = TtdMcpX64Context::default();
+        let status = unsafe {
+            x64_context(
+                self.handle.as_ptr(),
+                thread_id.unwrap_or_default(),
+                &mut context,
+            )
+        };
+        self.bridge
+            .ensure_ok(status, "reading x64 register context")?;
+
+        Ok(RegisterContextResponse {
+            session_id,
+            cursor_id,
+            position: context.position.into(),
+            previous_position: valid_position(context.previous_position).map(Into::into),
+            thread: (context.thread_unique_id != 0 || context.thread_id != 0).then_some(
+                CursorThreadState {
+                    unique_id: context.thread_unique_id,
+                    thread_id: context.thread_id,
+                },
+            ),
+            teb_address: (context.teb_address != 0).then_some(context.teb_address),
+            architecture: "x64".to_string(),
+            registers: context.into(),
+            module: None,
+        })
+    }
+
+    pub fn active_threads(&self) -> anyhow::Result<Vec<ActiveThreadState>> {
+        let active_threads: Symbol<ActiveThreadsFn> =
+            unsafe { self.bridge.symbol(b"ttd_mcp_active_threads\0")? };
+        let mut count = 0;
+        let status =
+            unsafe { active_threads(self.handle.as_ptr(), std::ptr::null_mut(), 0, &mut count) };
+        self.bridge
+            .ensure_ok(status, "querying active thread count")?;
+
+        let mut threads = vec![TtdMcpActiveThreadInfo::default(); count as usize];
+        let status = unsafe {
+            active_threads(
+                self.handle.as_ptr(),
+                threads.as_mut_ptr(),
+                count,
+                &mut count,
+            )
+        };
+        self.bridge.ensure_ok(status, "listing active threads")?;
+        threads.truncate(count as usize);
+        Ok(threads.into_iter().map(ActiveThreadState::from).collect())
     }
 
     pub fn step(
@@ -655,6 +1004,154 @@ impl From<TtdMcpExceptionInfo> for TraceException {
             program_counter: exception.program_counter,
             record_address: exception.record_address,
             parameters: exception.parameters[..parameter_count].to_vec(),
+        }
+    }
+}
+
+impl From<TtdMcpModuleEventInfo> for TraceModuleEvent {
+    fn from(event: TtdMcpModuleEventInfo) -> Self {
+        Self {
+            kind: match event.kind {
+                0 => ModuleEventKind::Load,
+                _ => ModuleEventKind::Unload,
+            },
+            position: event.position.into(),
+            module: event.module.into(),
+        }
+    }
+}
+
+impl From<TtdMcpThreadEventInfo> for TraceThreadEvent {
+    fn from(event: TtdMcpThreadEventInfo) -> Self {
+        Self {
+            kind: match event.kind {
+                0 => ThreadEventKind::Create,
+                _ => ThreadEventKind::Terminate,
+            },
+            position: event.position.into(),
+            thread: event.thread.into(),
+        }
+    }
+}
+
+impl From<TtdMcpActiveThreadInfo> for ActiveThreadState {
+    fn from(thread: TtdMcpActiveThreadInfo) -> Self {
+        Self {
+            thread: thread.thread.into(),
+            current_position: thread.current_position.into(),
+            last_valid_position: (thread.has_last_valid_position != 0)
+                .then(|| thread.last_valid_position.into()),
+            previous_position: (thread.has_previous_position != 0)
+                .then(|| thread.previous_position.into()),
+            teb_address: (thread.teb_address != 0).then_some(thread.teb_address),
+            program_counter: thread.program_counter,
+            stack_pointer: thread.stack_pointer,
+            frame_pointer: thread.frame_pointer,
+            basic_return_value: thread.basic_return_value,
+            module: None,
+        }
+    }
+}
+
+impl From<TtdMcpX64Context> for X64RegisterSet {
+    fn from(context: TtdMcpX64Context) -> Self {
+        let xmm = context
+            .xmm
+            .into_iter()
+            .map(VectorRegister128::from)
+            .collect::<Vec<_>>();
+        let ymm = context
+            .xmm
+            .into_iter()
+            .zip(context.ymm_high)
+            .map(|(low, high)| vector256_from_parts(low, high))
+            .collect::<Vec<_>>();
+
+        Self {
+            context_flags: context.context_flags,
+            mx_csr: context.mx_csr,
+            seg_cs: context.seg_cs,
+            seg_ds: context.seg_ds,
+            seg_es: context.seg_es,
+            seg_fs: context.seg_fs,
+            seg_gs: context.seg_gs,
+            seg_ss: context.seg_ss,
+            eflags: context.eflags,
+            dr0: context.dr0,
+            dr1: context.dr1,
+            dr2: context.dr2,
+            dr3: context.dr3,
+            dr6: context.dr6,
+            dr7: context.dr7,
+            rax: context.rax,
+            rcx: context.rcx,
+            rdx: context.rdx,
+            rbx: context.rbx,
+            rsp: context.rsp,
+            rbp: context.rbp,
+            rsi: context.rsi,
+            rdi: context.rdi,
+            r8: context.r8,
+            r9: context.r9,
+            r10: context.r10,
+            r11: context.r11,
+            r12: context.r12,
+            r13: context.r13,
+            r14: context.r14,
+            r15: context.r15,
+            rip: context.rip,
+            vector_control: context.vector_control,
+            debug_control: context.debug_control,
+            last_branch_to_rip: context.last_branch_to_rip,
+            last_branch_from_rip: context.last_branch_from_rip,
+            last_exception_to_rip: context.last_exception_to_rip,
+            last_exception_from_rip: context.last_exception_from_rip,
+            xmm,
+            ymm,
+        }
+    }
+}
+
+impl From<TtdMcpVector128> for VectorRegister128 {
+    fn from(value: TtdMcpVector128) -> Self {
+        Self {
+            low: value.low,
+            high: value.high,
+            hex: vector128_hex(value),
+        }
+    }
+}
+
+fn vector256_from_parts(low: TtdMcpVector128, high: TtdMcpVector128) -> VectorRegister256 {
+    let mut bytes = [0_u8; 32];
+    bytes[..16].copy_from_slice(&vector128_bytes(low));
+    bytes[16..].copy_from_slice(&vector128_bytes(high));
+    VectorRegister256 {
+        low: low.into(),
+        high: high.into(),
+        hex: bytes_to_hex(&bytes),
+    }
+}
+
+fn vector128_hex(value: TtdMcpVector128) -> String {
+    bytes_to_hex(&vector128_bytes(value))
+}
+
+fn vector128_bytes(value: TtdMcpVector128) -> [u8; 16] {
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&value.low.to_le_bytes());
+    bytes[8..].copy_from_slice(&value.high.to_le_bytes());
+    bytes
+}
+
+impl From<TtdMcpMemoryBufferRangeInfo> for MemoryBufferRange {
+    fn from(range: TtdMcpMemoryBufferRangeInfo) -> Self {
+        Self {
+            offset: range.offset,
+            address: range.address,
+            size: range.size,
+            sequence: range.sequence,
+            module: None,
         }
     }
 }

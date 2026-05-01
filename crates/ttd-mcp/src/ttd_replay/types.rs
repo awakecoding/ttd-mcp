@@ -52,6 +52,10 @@ pub struct ReplayCapabilities {
     pub close_trace: bool,
     pub list_threads: bool,
     pub list_modules: bool,
+    pub list_keyframes: bool,
+    pub module_events: bool,
+    pub thread_events: bool,
+    pub active_threads: bool,
     pub module_info: bool,
     pub address_info: bool,
     pub list_exceptions: bool,
@@ -61,10 +65,13 @@ pub struct ReplayCapabilities {
     pub step: bool,
     pub compact_registers: bool,
     pub full_registers: bool,
+    pub avx_registers: bool,
     pub stack_info: bool,
     pub stack_read: bool,
     pub command_line: bool,
     pub read_memory: bool,
+    pub memory_range: bool,
+    pub memory_buffer_ranges: bool,
     pub memory_watchpoint: bool,
     pub memory_regions: bool,
     pub search_memory: bool,
@@ -100,6 +107,49 @@ pub struct TraceModule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleList {
     pub modules: Vec<TraceModule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyframeList {
+    pub keyframes: Vec<Position>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleEventList {
+    pub events: Vec<TraceModuleEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceModuleEvent {
+    pub kind: ModuleEventKind,
+    pub position: Position,
+    pub module: TraceModule,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModuleEventKind {
+    Load,
+    Unload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadEventList {
+    pub events: Vec<TraceThreadEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceThreadEvent {
+    pub kind: ThreadEventKind,
+    pub position: Position,
+    pub thread: TraceThread,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadEventKind {
+    Create,
+    Terminate,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -206,7 +256,7 @@ pub struct CursorPosition {
     pub position: Position,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CursorThreadState {
     pub unique_id: u64,
     pub thread_id: u32,
@@ -224,6 +274,165 @@ pub struct CursorRegisters {
     pub stack_pointer: u64,
     pub frame_pointer: u64,
     pub basic_return_value: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RegisterContextRequest {
+    pub session_id: u64,
+    pub cursor_id: u64,
+    #[serde(default)]
+    pub thread_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterContextResponse {
+    pub session_id: u64,
+    pub cursor_id: u64,
+    pub position: Position,
+    pub previous_position: Option<Position>,
+    pub thread: Option<CursorThreadState>,
+    pub teb_address: Option<u64>,
+    pub architecture: String,
+    pub registers: X64RegisterSet,
+    pub module: Option<AddressModuleCoordinate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct X64RegisterSet {
+    pub context_flags: u32,
+    pub mx_csr: u32,
+    pub seg_cs: u16,
+    pub seg_ds: u16,
+    pub seg_es: u16,
+    pub seg_fs: u16,
+    pub seg_gs: u16,
+    pub seg_ss: u16,
+    pub eflags: u32,
+    pub dr0: u64,
+    pub dr1: u64,
+    pub dr2: u64,
+    pub dr3: u64,
+    pub dr6: u64,
+    pub dr7: u64,
+    pub rax: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rbx: u64,
+    pub rsp: u64,
+    pub rbp: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rip: u64,
+    pub vector_control: u64,
+    pub debug_control: u64,
+    pub last_branch_to_rip: u64,
+    pub last_branch_from_rip: u64,
+    pub last_exception_to_rip: u64,
+    pub last_exception_from_rip: u64,
+    pub xmm: Vec<VectorRegister128>,
+    pub ymm: Vec<VectorRegister256>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorRegister128 {
+    pub low: u64,
+    pub high: u64,
+    pub hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorRegister256 {
+    pub low: VectorRegister128,
+    pub high: VectorRegister128,
+    pub hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveThreadList {
+    pub session_id: u64,
+    pub cursor_id: u64,
+    pub cursor_position: Position,
+    pub threads: Vec<ActiveThreadState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveThreadState {
+    pub thread: TraceThread,
+    pub current_position: Position,
+    pub last_valid_position: Option<Position>,
+    pub previous_position: Option<Position>,
+    pub teb_address: Option<u64>,
+    pub program_counter: u64,
+    pub stack_pointer: u64,
+    pub frame_pointer: u64,
+    pub basic_return_value: u64,
+    pub module: Option<AddressModuleCoordinate>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct MemoryRangeRequest {
+    pub session_id: u64,
+    pub cursor_id: u64,
+    pub address: u64,
+    #[serde(default = "default_memory_range_max_bytes")]
+    pub max_bytes: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryRangeResponse {
+    pub session_id: u64,
+    pub cursor_id: u64,
+    pub requested_address: u64,
+    pub range_address: u64,
+    pub sequence: u64,
+    pub bytes_available: u64,
+    pub bytes_returned: usize,
+    pub complete: bool,
+    pub encoding: String,
+    pub data: String,
+    pub module: Option<AddressModuleCoordinate>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct MemoryBufferRequest {
+    pub session_id: u64,
+    pub cursor_id: u64,
+    pub address: u64,
+    pub size: u32,
+    #[serde(default = "default_memory_buffer_max_ranges")]
+    pub max_ranges: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryBufferResponse {
+    pub session_id: u64,
+    pub cursor_id: u64,
+    pub requested_address: u64,
+    pub requested_size: u32,
+    pub address: u64,
+    pub bytes_read: usize,
+    pub complete: bool,
+    pub ranges_truncated: bool,
+    pub encoding: String,
+    pub data: String,
+    pub ranges: Vec<MemoryBufferRange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryBufferRange {
+    pub offset: u32,
+    pub address: u64,
+    pub size: u64,
+    pub sequence: u64,
+    pub module: Option<AddressModuleCoordinate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -426,4 +635,12 @@ fn default_step_count() -> u32 {
 
 fn default_stack_read_size() -> u32 {
     256
+}
+
+fn default_memory_range_max_bytes() -> u32 {
+    256
+}
+
+fn default_memory_buffer_max_ranges() -> u32 {
+    64
 }

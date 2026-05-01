@@ -221,10 +221,17 @@ fn mcp_smoke() -> anyhow::Result<()> {
     ensure!(
         tool_names.contains(&"ttd_load_trace")
             && tool_names.contains(&"ttd_capabilities")
+            && tool_names.contains(&"ttd_list_keyframes")
+            && tool_names.contains(&"ttd_module_events")
+            && tool_names.contains(&"ttd_thread_events")
             && tool_names.contains(&"ttd_module_info")
             && tool_names.contains(&"ttd_address_info")
+            && tool_names.contains(&"ttd_active_threads")
+            && tool_names.contains(&"ttd_register_context")
             && tool_names.contains(&"ttd_stack_info")
             && tool_names.contains(&"ttd_stack_read")
+            && tool_names.contains(&"ttd_memory_range")
+            && tool_names.contains(&"ttd_memory_buffer")
             && tool_names.contains(&"ttd_read_memory"),
         "packaged MCP server did not advertise expected tools: {tools}"
     );

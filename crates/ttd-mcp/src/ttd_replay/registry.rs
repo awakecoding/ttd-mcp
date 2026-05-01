@@ -14,6 +14,8 @@ const RTL_USER_PROCESS_PARAMETERS_COMMAND_LINE_OFFSET_X64: usize = 0x70;
 const UNICODE_STRING_X64_SIZE: usize = 16;
 const MAX_COMMAND_LINE_BYTES: usize = 0x8000;
 const MAX_STACK_READ_BYTES: u32 = 0x1000;
+const MAX_MEMORY_RANGE_BYTES: u32 = 0x10000;
+const MAX_MEMORY_BUFFER_RANGES: u32 = 1024;
 const POINTER_SIZE_X64: usize = 8;
 
 pub type SessionId = u64;
@@ -105,7 +107,6 @@ impl SessionRegistry {
             );
         }
         limitations.extend([
-            "full register contexts are not exposed yet".to_string(),
             "memory region enumeration is not exposed yet".to_string(),
             "symbol resolution is not exposed yet".to_string(),
             "API/call tracing is not exposed yet".to_string(),
@@ -122,6 +123,10 @@ impl SessionRegistry {
                 close_trace: true,
                 list_threads: native,
                 list_modules: native,
+                list_keyframes: native,
+                module_events: native,
+                thread_events: native,
+                active_threads: native,
                 module_info: native,
                 address_info: native,
                 list_exceptions: native,
@@ -130,11 +135,14 @@ impl SessionRegistry {
                 position_set: true,
                 step: native,
                 compact_registers: native,
-                full_registers: false,
+                full_registers: native,
+                avx_registers: native,
                 stack_info: native,
                 stack_read: native,
                 command_line,
                 read_memory: native,
+                memory_range: native,
+                memory_buffer_ranges: native,
                 memory_watchpoint: native,
                 memory_regions: false,
                 search_memory: false,
@@ -170,6 +178,41 @@ impl SessionRegistry {
             modules: Vec::new(),
         }
         .with_symbol_hint(session.symbols.symbol_path.clone()))
+    }
+
+    pub fn list_keyframes(&self, session_id: SessionId) -> anyhow::Result<KeyframeList> {
+        let session = self.session(session_id)?;
+        if let Some(native) = session.native.as_ref() {
+            return Ok(KeyframeList {
+                keyframes: native.list_keyframes()?,
+            });
+        }
+
+        Ok(KeyframeList {
+            keyframes: Vec::new(),
+        })
+    }
+
+    pub fn list_module_events(&self, session_id: SessionId) -> anyhow::Result<ModuleEventList> {
+        let session = self.session(session_id)?;
+        if let Some(native) = session.native.as_ref() {
+            return Ok(ModuleEventList {
+                events: native.list_module_events()?,
+            });
+        }
+
+        Ok(ModuleEventList { events: Vec::new() })
+    }
+
+    pub fn list_thread_events(&self, session_id: SessionId) -> anyhow::Result<ThreadEventList> {
+        let session = self.session(session_id)?;
+        if let Some(native) = session.native.as_ref() {
+            return Ok(ThreadEventList {
+                events: native.list_thread_events()?,
+            });
+        }
+
+        Ok(ThreadEventList { events: Vec::new() })
     }
 
     pub fn module_info(&self, request: ModuleInfoRequest) -> anyhow::Result<ModuleInfoResponse> {
@@ -243,6 +286,34 @@ impl SessionRegistry {
             module,
             registers: register_context(&registers),
             stack,
+        })
+    }
+
+    pub fn active_threads(
+        &self,
+        session_id: SessionId,
+        cursor_id: CursorId,
+    ) -> anyhow::Result<ActiveThreadList> {
+        let cursor_position = self.cursor_position(session_id, cursor_id)?.position;
+        let cursor = self.cursor(session_id, cursor_id)?;
+        let Some(native) = cursor.native.as_ref() else {
+            bail!("ttd_active_threads requires a native TTD replay cursor")
+        };
+
+        let modules = self.list_modules(session_id)?.modules;
+        let mut threads = native.active_threads()?;
+        for thread in &mut threads {
+            thread.module = modules
+                .iter()
+                .find(|module| address_in_module(thread.program_counter, module))
+                .map(|module| module_coordinate(thread.program_counter, module));
+        }
+
+        Ok(ActiveThreadList {
+            session_id,
+            cursor_id,
+            cursor_position,
+            threads,
         })
     }
 
@@ -346,6 +417,25 @@ impl SessionRegistry {
         };
 
         native.registers(session_id, cursor_id)
+    }
+
+    pub fn register_context(
+        &self,
+        request: RegisterContextRequest,
+    ) -> anyhow::Result<RegisterContextResponse> {
+        let cursor = self.cursor(request.session_id, request.cursor_id)?;
+        let Some(native) = cursor.native.as_ref() else {
+            bail!("ttd_register_context requires a native TTD replay cursor")
+        };
+
+        let modules = self.list_modules(request.session_id)?.modules;
+        let mut context =
+            native.x64_context(request.session_id, request.cursor_id, request.thread_id)?;
+        context.module = modules
+            .iter()
+            .find(|module| address_in_module(context.registers.rip, module))
+            .map(|module| module_coordinate(context.registers.rip, module));
+        Ok(context)
     }
 
     pub fn stack_info(
@@ -525,6 +615,71 @@ impl SessionRegistry {
             request.address,
             request.size,
         )
+    }
+
+    pub fn memory_range(&self, request: MemoryRangeRequest) -> anyhow::Result<MemoryRangeResponse> {
+        ensure!(request.address != 0, "address must be non-zero");
+        ensure!(
+            request.max_bytes <= MAX_MEMORY_RANGE_BYTES,
+            "max_bytes must be 64 KiB or less"
+        );
+        let cursor = self.cursor(request.session_id, request.cursor_id)?;
+        let Some(native) = cursor.native.as_ref() else {
+            bail!("ttd_memory_range requires a native TTD replay cursor")
+        };
+
+        let mut range = native.memory_range(
+            request.session_id,
+            request.cursor_id,
+            request.address,
+            request.max_bytes,
+        )?;
+        let modules = self.list_modules(request.session_id)?.modules;
+        range.module = modules
+            .iter()
+            .find(|module| address_in_module(range.range_address, module))
+            .map(|module| module_coordinate(range.range_address, module));
+        Ok(range)
+    }
+
+    pub fn memory_buffer(
+        &self,
+        request: MemoryBufferRequest,
+    ) -> anyhow::Result<MemoryBufferResponse> {
+        ensure!(request.address != 0, "address must be non-zero");
+        ensure!(request.size > 0, "size must be greater than zero");
+        ensure!(
+            request.size <= MAX_MEMORY_RANGE_BYTES,
+            "size must be 64 KiB or less"
+        );
+        ensure!(
+            request.max_ranges > 0,
+            "max_ranges must be greater than zero"
+        );
+        ensure!(
+            request.max_ranges <= MAX_MEMORY_BUFFER_RANGES,
+            "max_ranges must be 1024 or less"
+        );
+        let cursor = self.cursor(request.session_id, request.cursor_id)?;
+        let Some(native) = cursor.native.as_ref() else {
+            bail!("ttd_memory_buffer requires a native TTD replay cursor")
+        };
+
+        let mut response = native.memory_buffer_with_ranges(
+            request.session_id,
+            request.cursor_id,
+            request.address,
+            request.size,
+            request.max_ranges,
+        )?;
+        let modules = self.list_modules(request.session_id)?.modules;
+        for range in &mut response.ranges {
+            range.module = modules
+                .iter()
+                .find(|module| address_in_module(range.address, module))
+                .map(|module| module_coordinate(range.address, module));
+        }
+        Ok(response)
     }
 
     pub fn memory_watchpoint(

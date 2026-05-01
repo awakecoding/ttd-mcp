@@ -241,6 +241,48 @@ fn ping_trace_replay_scenario_over_mcp_stdio() -> anyhow::Result<()> {
         "native MCP module list should include ping.exe: {modules}"
     );
 
+    let keyframes = client.call_tool_json(
+        49,
+        "ttd_list_keyframes",
+        json!({
+            "session_id": session_id,
+        }),
+    )?;
+    ensure!(
+        keyframes["keyframes"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "native MCP keyframe list should include positions: {keyframes}"
+    );
+
+    let module_events = client.call_tool_json(
+        50,
+        "ttd_module_events",
+        json!({
+            "session_id": session_id,
+        }),
+    )?;
+    ensure!(
+        module_events["events"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "native MCP module events should include load/unload events: {module_events}"
+    );
+
+    let thread_events = client.call_tool_json(
+        51,
+        "ttd_thread_events",
+        json!({
+            "session_id": session_id,
+        }),
+    )?;
+    ensure!(
+        thread_events["events"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "native MCP thread events should include create/terminate events: {thread_events}"
+    );
+
     let module_info = client.call_tool_json(
         44,
         "ttd_module_info",
@@ -311,6 +353,27 @@ fn ping_trace_replay_scenario_over_mcp_stdio() -> anyhow::Result<()> {
         "address_info should include cursor position and register context: {address_info}"
     );
 
+    let active_threads = client.call_tool_json(
+        52,
+        "ttd_active_threads",
+        json!({
+            "session_id": session_id,
+            "cursor_id": cursor_id,
+        }),
+    )?;
+    ensure!(
+        active_threads["threads"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "active_threads should include at least one active thread: {active_threads}"
+    );
+    ensure!(
+        active_threads["threads"][0]["program_counter"]
+            .as_u64()
+            .is_some_and(|value| value != 0),
+        "active_threads should include runtime PCs: {active_threads}"
+    );
+
     let registers = client.call_tool_json(
         36,
         "ttd_registers",
@@ -330,6 +393,45 @@ fn ping_trace_replay_scenario_over_mcp_stdio() -> anyhow::Result<()> {
             .as_u64()
             .is_some_and(|value| value != 0),
         "register snapshot should include a non-zero stack pointer: {registers}"
+    );
+
+    let register_context = client.call_tool_json(
+        54,
+        "ttd_register_context",
+        json!({
+            "session_id": session_id,
+            "cursor_id": cursor_id,
+        }),
+    )?;
+    ensure!(
+        register_context["architecture"] == "x64"
+            && register_context["registers"]["rip"] == registers["program_counter"]
+            && register_context["registers"]["rsp"] == registers["stack_pointer"],
+        "register_context should include full x64 state matching compact registers: {register_context}"
+    );
+    ensure!(
+        register_context["registers"]["xmm"]
+            .as_array()
+            .is_some_and(|items| items.len() == 16)
+            && register_context["registers"]["ymm"]
+                .as_array()
+                .is_some_and(|items| items.len() == 16),
+        "register_context should include XMM/YMM vector register arrays: {register_context}"
+    );
+    ensure!(
+        register_context["registers"]["xmm"][0]["hex"]
+            .as_str()
+            .is_some_and(|value| value.len() == 32)
+            && register_context["registers"]["ymm"][0]["hex"]
+                .as_str()
+                .is_some_and(|value| value.len() == 64),
+        "register_context should include hex-encoded vector register bytes: {register_context}"
+    );
+    ensure!(
+        register_context["module"]["name"]
+            .as_str()
+            .is_some_and(|name| !name.is_empty()),
+        "register_context should include module/RVA coordinates for RIP when available: {register_context}"
     );
 
     let stack_info = client.call_tool_json(
@@ -449,6 +551,66 @@ fn ping_trace_replay_scenario_over_mcp_stdio() -> anyhow::Result<()> {
     ensure!(
         memory["encoding"] == "hex",
         "memory response should be hex encoded: {memory}"
+    );
+
+    let memory_range = client.call_tool_json(
+        53,
+        "ttd_memory_range",
+        json!({
+            "session_id": session_id,
+            "cursor_id": cursor_id,
+            "address": ping_base,
+            "max_bytes": 64,
+        }),
+    )?;
+    ensure!(
+        memory_range["bytes_available"]
+            .as_u64()
+            .is_some_and(|value| value > 0),
+        "memory_range should report available trace-backed bytes: {memory_range}"
+    );
+    ensure!(
+        memory_range["bytes_returned"]
+            .as_u64()
+            .is_some_and(|value| value > 0)
+            && memory_range["encoding"] == "hex",
+        "memory_range should return bounded hex data: {memory_range}"
+    );
+    ensure!(
+        memory_range["module"]["name"]
+            .as_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case("ping.exe")),
+        "memory_range should include module coordinates for ping.exe base: {memory_range}"
+    );
+
+    let memory_buffer = client.call_tool_json(
+        55,
+        "ttd_memory_buffer",
+        json!({
+            "session_id": session_id,
+            "cursor_id": cursor_id,
+            "address": ping_base,
+            "size": 64,
+            "max_ranges": 8,
+        }),
+    )?;
+    ensure!(
+        memory_buffer["bytes_read"]
+            .as_u64()
+            .is_some_and(|value| value > 0)
+            && memory_buffer["encoding"] == "hex",
+        "memory_buffer should return bounded hex data: {memory_buffer}"
+    );
+    ensure!(
+        memory_buffer["ranges"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "memory_buffer should include source ranges: {memory_buffer}"
+    );
+    ensure!(
+        memory_buffer["ranges"][0]["offset"].is_u64()
+            && memory_buffer["ranges"][0]["sequence"].is_u64(),
+        "memory_buffer source ranges should include offsets and source sequences: {memory_buffer}"
     );
 
     let command_line_address = command_line["command_line_address"]
@@ -655,18 +817,25 @@ fn expected_tool_names() -> &'static [&'static str] {
         "ttd_capabilities",
         "ttd_list_threads",
         "ttd_list_modules",
+        "ttd_list_keyframes",
+        "ttd_module_events",
+        "ttd_thread_events",
         "ttd_module_info",
         "ttd_address_info",
+        "ttd_active_threads",
         "ttd_list_exceptions",
         "ttd_cursor_create",
         "ttd_position_get",
         "ttd_position_set",
         "ttd_step",
         "ttd_registers",
+        "ttd_register_context",
         "ttd_stack_info",
         "ttd_stack_read",
         "ttd_command_line",
         "ttd_read_memory",
+        "ttd_memory_range",
+        "ttd_memory_buffer",
         "ttd_memory_watchpoint",
     ]
 }
@@ -711,17 +880,25 @@ fn required_args_for_tool(name: &str) -> anyhow::Result<&'static [&'static str]>
         | "ttd_capabilities"
         | "ttd_list_threads"
         | "ttd_list_modules"
+        | "ttd_list_keyframes"
+        | "ttd_module_events"
+        | "ttd_thread_events"
         | "ttd_module_info"
         | "ttd_list_exceptions"
         | "ttd_cursor_create" => Ok(&["session_id"]),
-        "ttd_position_get" | "ttd_registers" | "ttd_stack_info" | "ttd_command_line" => {
-            Ok(&["session_id", "cursor_id"])
-        }
+        "ttd_position_get"
+        | "ttd_registers"
+        | "ttd_register_context"
+        | "ttd_active_threads"
+        | "ttd_stack_info"
+        | "ttd_command_line" => Ok(&["session_id", "cursor_id"]),
         "ttd_address_info" => Ok(&["session_id", "cursor_id", "address"]),
         "ttd_position_set" => Ok(&["session_id", "cursor_id", "position"]),
         "ttd_step" => Ok(&["session_id", "cursor_id"]),
         "ttd_stack_read" => Ok(&["session_id", "cursor_id"]),
         "ttd_read_memory" => Ok(&["session_id", "cursor_id", "address", "size"]),
+        "ttd_memory_range" => Ok(&["session_id", "cursor_id", "address"]),
+        "ttd_memory_buffer" => Ok(&["session_id", "cursor_id", "address", "size"]),
         "ttd_memory_watchpoint" => Ok(&[
             "session_id",
             "cursor_id",
