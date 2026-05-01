@@ -10,6 +10,8 @@ target/
 *.ttd
 *.run.err
 .ttd-symbol-cache/
+traces/*/
+!traces/*.7z
 traces/**/*.out
 native/**/packages/
 native/**/x64/

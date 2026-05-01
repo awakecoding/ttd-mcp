@@ -1,4 +1,7 @@
-use super::types::{TraceException, TraceModule, TraceThread};
+use super::types::{
+    CursorRegisters, CursorThreadState, ReadMemoryResponse, TraceException, TraceModule,
+    TraceThread,
+};
 use super::{Position, ResolvedSymbolConfig};
 use anyhow::{bail, Context};
 use libloading::{Library, Symbol};
@@ -85,6 +88,28 @@ struct TtdMcpExceptionInfo {
     parameters: [u64; EXCEPTION_PARAMETER_COUNT],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TtdMcpMemoryRead {
+    address: u64,
+    bytes_read: u32,
+    complete: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TtdMcpCursorState {
+    position: TtdMcpPosition,
+    previous_position: TtdMcpPosition,
+    thread_unique_id: u64,
+    thread_id: u32,
+    teb_address: u64,
+    program_counter: u64,
+    stack_pointer: u64,
+    frame_pointer: u64,
+    basic_return_value: u64,
+}
+
 type OpenTraceFn =
     unsafe extern "C" fn(*const u16, *const TtdMcpSymbolConfig, *mut *mut TtdMcpTrace) -> i32;
 type CloseTraceFn = unsafe extern "C" fn(*mut TtdMcpTrace);
@@ -99,6 +124,9 @@ type NewCursorFn = unsafe extern "C" fn(*mut TtdMcpTrace, *mut *mut TtdMcpCursor
 type FreeCursorFn = unsafe extern "C" fn(*mut TtdMcpCursor);
 type CursorPositionFn = unsafe extern "C" fn(*mut TtdMcpCursor, *mut TtdMcpPosition) -> i32;
 type SetPositionFn = unsafe extern "C" fn(*mut TtdMcpCursor, TtdMcpPosition) -> i32;
+type ReadMemoryFn =
+    unsafe extern "C" fn(*mut TtdMcpCursor, u64, *mut u8, u32, *mut TtdMcpMemoryRead) -> i32;
+type CursorStateFn = unsafe extern "C" fn(*mut TtdMcpCursor, *mut TtdMcpCursorState) -> i32;
 type LastErrorFn = unsafe extern "C" fn() -> *const i8;
 
 pub struct NativeBridge {
@@ -336,6 +364,70 @@ impl NativeCursor {
         let status = unsafe { set_position(self.handle.as_ptr(), position.into()) };
         self.bridge.ensure_ok(status, "setting cursor position")
     }
+
+    pub fn read_memory(
+        &self,
+        session_id: u64,
+        cursor_id: u64,
+        address: u64,
+        size: u32,
+    ) -> anyhow::Result<ReadMemoryResponse> {
+        let read_memory: Symbol<ReadMemoryFn> =
+            unsafe { self.bridge.symbol(b"ttd_mcp_read_memory\0")? };
+        let mut buffer = vec![0; size as usize];
+        let mut result = TtdMcpMemoryRead::default();
+        let status = unsafe {
+            read_memory(
+                self.handle.as_ptr(),
+                address,
+                buffer.as_mut_ptr(),
+                size,
+                &mut result,
+            )
+        };
+        self.bridge.ensure_ok(status, "reading cursor memory")?;
+
+        let bytes_read = (result.bytes_read as usize).min(buffer.len());
+        buffer.truncate(bytes_read);
+        Ok(ReadMemoryResponse {
+            session_id,
+            cursor_id,
+            requested_address: address,
+            address: result.address,
+            requested_size: size,
+            bytes_read,
+            complete: result.complete != 0,
+            encoding: "hex".to_string(),
+            data: bytes_to_hex(&buffer),
+        })
+    }
+
+    pub fn registers(&self, session_id: u64, cursor_id: u64) -> anyhow::Result<CursorRegisters> {
+        let cursor_state: Symbol<CursorStateFn> =
+            unsafe { self.bridge.symbol(b"ttd_mcp_cursor_state\0")? };
+        let mut state = TtdMcpCursorState::default();
+        let status = unsafe { cursor_state(self.handle.as_ptr(), &mut state) };
+        self.bridge
+            .ensure_ok(status, "reading cursor register state")?;
+
+        Ok(CursorRegisters {
+            session_id,
+            cursor_id,
+            position: state.position.into(),
+            previous_position: valid_position(state.previous_position).map(Into::into),
+            thread: (state.thread_unique_id != 0 || state.thread_id != 0).then_some(
+                CursorThreadState {
+                    unique_id: state.thread_unique_id,
+                    thread_id: state.thread_id,
+                },
+            ),
+            teb_address: (state.teb_address != 0).then_some(state.teb_address),
+            program_counter: state.program_counter,
+            stack_pointer: state.stack_pointer,
+            frame_pointer: state.frame_pointer,
+            basic_return_value: state.basic_return_value,
+        })
+    }
 }
 
 impl Drop for NativeCursor {
@@ -567,6 +659,20 @@ fn utf16_fixed_to_string(value: &[u16]) -> String {
         .position(|character| *character == 0)
         .unwrap_or(value.len());
     String::from_utf16_lossy(&value[..length])
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn valid_position(position: TtdMcpPosition) -> Option<TtdMcpPosition> {
+    (position.sequence != u64::MAX).then_some(position)
 }
 
 #[cfg(windows)]

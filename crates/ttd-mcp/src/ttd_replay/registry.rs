@@ -8,6 +8,11 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 
+const PEB_PROCESS_PARAMETERS_OFFSET_X64: usize = 0x20;
+const RTL_USER_PROCESS_PARAMETERS_COMMAND_LINE_OFFSET_X64: usize = 0x70;
+const UNICODE_STRING_X64_SIZE: usize = 16;
+const MAX_COMMAND_LINE_BYTES: usize = 0x8000;
+
 pub type SessionId = u64;
 pub type CursorId = u64;
 
@@ -182,17 +187,117 @@ impl SessionRegistry {
         bail!("ttd_step is not implemented in the native TTD Replay API bridge yet")
     }
 
-    pub fn registers(&self, session_id: SessionId, cursor_id: CursorId) -> anyhow::Result<Value> {
-        let _ = self.cursor(session_id, cursor_id)?;
-        bail!("ttd_registers is not implemented in the native TTD Replay API bridge yet")
+    pub fn registers(
+        &self,
+        session_id: SessionId,
+        cursor_id: CursorId,
+    ) -> anyhow::Result<CursorRegisters> {
+        let cursor = self.cursor(session_id, cursor_id)?;
+        let Some(native) = cursor.native.as_ref() else {
+            bail!("ttd_registers requires a native TTD replay cursor")
+        };
+
+        native.registers(session_id, cursor_id)
     }
 
-    pub fn read_memory(&self, request: ReadMemoryRequest) -> anyhow::Result<Value> {
+    pub fn command_line(
+        &self,
+        session_id: SessionId,
+        cursor_id: CursorId,
+    ) -> anyhow::Result<ProcessCommandLine> {
+        let session = self.session(session_id)?;
+        let peb_address = session
+            .info
+            .peb_address
+            .ok_or_else(|| anyhow::anyhow!("trace info does not include a PEB address"))?;
+        let cursor = self.cursor(session_id, cursor_id)?;
+
+        let peb = read_exact_memory(
+            cursor,
+            session_id,
+            cursor_id,
+            peb_address,
+            (PEB_PROCESS_PARAMETERS_OFFSET_X64 + 8) as u32,
+            "PEB",
+        )?;
+        let process_parameters_address = read_u64(&peb, PEB_PROCESS_PARAMETERS_OFFSET_X64)
+            .ok_or_else(|| anyhow::anyhow!("PEB read did not include ProcessParameters"))?;
+        ensure!(
+            process_parameters_address != 0,
+            "PEB ProcessParameters pointer is null"
+        );
+
+        let process_parameters = read_exact_memory(
+            cursor,
+            session_id,
+            cursor_id,
+            process_parameters_address + RTL_USER_PROCESS_PARAMETERS_COMMAND_LINE_OFFSET_X64 as u64,
+            UNICODE_STRING_X64_SIZE as u32,
+            "RTL_USER_PROCESS_PARAMETERS.CommandLine",
+        )?;
+
+        let command_line_length = read_u16(&process_parameters, 0)
+            .ok_or_else(|| anyhow::anyhow!("CommandLine read did not include Length"))?
+            as usize;
+        let command_line_maximum_length = read_u16(&process_parameters, 2)
+            .ok_or_else(|| anyhow::anyhow!("CommandLine read did not include MaximumLength"))?
+            as usize;
+        let command_line_address = read_u64(&process_parameters, 8)
+            .ok_or_else(|| anyhow::anyhow!("CommandLine read did not include Buffer"))?;
+
+        ensure!(command_line_length > 0, "CommandLine length is zero");
+        ensure!(
+            command_line_length <= command_line_maximum_length,
+            "CommandLine length exceeds maximum length"
+        );
+        ensure!(
+            command_line_length <= MAX_COMMAND_LINE_BYTES,
+            "CommandLine length is larger than supported maximum"
+        );
+        ensure!(
+            command_line_length.is_multiple_of(2),
+            "CommandLine length is not UTF-16 aligned"
+        );
+        ensure!(
+            command_line_address != 0,
+            "CommandLine buffer pointer is null"
+        );
+
+        let command_line_bytes = read_exact_memory(
+            cursor,
+            session_id,
+            cursor_id,
+            command_line_address,
+            command_line_length as u32,
+            "CommandLine buffer",
+        )?;
+        let command_line = utf16le_to_string(&command_line_bytes)?;
+
+        Ok(ProcessCommandLine {
+            session_id,
+            cursor_id,
+            peb_address,
+            process_parameters_address,
+            command_line_address,
+            command_line,
+        })
+    }
+
+    pub fn read_memory(&self, request: ReadMemoryRequest) -> anyhow::Result<ReadMemoryResponse> {
         ensure!(request.size > 0, "size must be greater than zero");
         ensure!(request.size <= 0x10000, "size must be 64 KiB or less");
         ensure!(request.address != 0, "address must be non-zero");
-        let _ = self.cursor(request.session_id, request.cursor_id)?;
-        bail!("ttd_read_memory is not implemented in the native TTD Replay API bridge yet")
+        let cursor = self.cursor(request.session_id, request.cursor_id)?;
+        let Some(native) = cursor.native.as_ref() else {
+            bail!("ttd_read_memory requires a native TTD replay cursor")
+        };
+
+        native.read_memory(
+            request.session_id,
+            request.cursor_id,
+            request.address,
+            request.size,
+        )
     }
 
     pub fn memory_watchpoint(&self, request: MemoryWatchpointRequest) -> anyhow::Result<Value> {
@@ -237,6 +342,78 @@ impl SessionRegistry {
             .get_mut(&cursor_id)
             .ok_or_else(|| anyhow::anyhow!("unknown cursor id: {cursor_id}"))
     }
+}
+
+fn read_exact_memory(
+    cursor: &ReplayCursor,
+    session_id: SessionId,
+    cursor_id: CursorId,
+    address: u64,
+    size: u32,
+    label: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let Some(native) = cursor.native.as_ref() else {
+        bail!("{label} read requires a native TTD replay cursor")
+    };
+    let response = native.read_memory(session_id, cursor_id, address, size)?;
+    ensure!(
+        response.address == address,
+        "{label} read started at {:#x}, expected {:#x}",
+        response.address,
+        address
+    );
+    ensure!(
+        response.bytes_read == size as usize,
+        "{label} read returned {} bytes, expected {}",
+        response.bytes_read,
+        size
+    );
+    hex_to_bytes(&response.data)
+}
+
+fn hex_to_bytes(hex: &str) -> anyhow::Result<Vec<u8>> {
+    ensure!(
+        hex.len().is_multiple_of(2),
+        "hex string length must be even"
+    );
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for chunk in hex.as_bytes().chunks_exact(2) {
+        let high = hex_digit(chunk[0])?;
+        let low = hex_digit(chunk[1])?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn hex_digit(byte: u8) -> anyhow::Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => bail!("invalid hex digit"),
+    }
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let raw: [u8; 2] = bytes.get(offset..offset + 2)?.try_into().ok()?;
+    Some(u16::from_le_bytes(raw))
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    let raw: [u8; 8] = bytes.get(offset..offset + 8)?.try_into().ok()?;
+    Some(u64::from_le_bytes(raw))
+}
+
+fn utf16le_to_string(bytes: &[u8]) -> anyhow::Result<String> {
+    ensure!(
+        bytes.len().is_multiple_of(2),
+        "UTF-16LE byte count must be even"
+    );
+    let units = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect::<Vec<_>>();
+    String::from_utf16(&units).map_err(Into::into)
 }
 
 fn try_open_native_trace(

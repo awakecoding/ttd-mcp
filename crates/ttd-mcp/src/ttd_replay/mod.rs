@@ -8,7 +8,8 @@ pub use position::{Position, PositionOrPercent};
 pub use registry::{CursorId, SessionId, SessionRegistry};
 pub use symbols::{ResolvedSymbolConfig, SymbolSettings};
 pub use types::{
-    CursorPosition, LoadTraceRequest, LoadTraceResponse, MemoryAccessDirection,
-    MemoryWatchpointRequest, ModuleList, PositionRequest, ReadMemoryRequest, StepRequest,
-    TraceException, TraceInfo, TraceModule, TraceThread,
+    CursorPosition, CursorRegisters, CursorThreadState, LoadTraceRequest, LoadTraceResponse,
+    MemoryAccessDirection, MemoryWatchpointRequest, ModuleList, PositionRequest,
+    ProcessCommandLine, ReadMemoryRequest, ReadMemoryResponse, StepRequest, TraceException,
+    TraceInfo, TraceModule, TraceThread,
 };

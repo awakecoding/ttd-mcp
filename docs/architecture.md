@@ -45,4 +45,4 @@ The Rust facade resolves caller settings into a process-local symbol configurati
 
 ## Current State
 
-The Rust MCP server and native bridge boundary are scaffolded, built, and wired for the first native replay slices. The server can advertise tools, validate inputs, load a trace through `ttd_mcp_open_trace`, read `ttd_mcp_trace_info`, enumerate threads/modules/exceptions, create cursors, and get/set cursor positions. The next implementation step is to add native-backed register reads, memory reads, stepping, and watchpoint replay.
+The Rust MCP server and native bridge boundary are scaffolded, built, and wired for the first native replay slices. The server can advertise tools, validate inputs, load a trace through `ttd_mcp_open_trace`, read `ttd_mcp_trace_info`, enumerate threads/modules/exceptions, create cursors, get/set cursor positions, read core cursor register/thread state, read bounded guest memory at a cursor, and extract the process command line from PEB process parameters. The next implementation step is to add native-backed stepping and watchpoint replay.

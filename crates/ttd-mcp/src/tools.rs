@@ -66,7 +66,11 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool::<CursorArg>(
             "ttd_registers",
-            "Read register state at a replay cursor position.",
+            "Read core register and thread state at a replay cursor position.",
+        ),
+        tool::<CursorArg>(
+            "ttd_command_line",
+            "Read the process command line from PEB process parameters at a replay cursor position.",
         ),
         tool::<ReadMemoryRequest>(
             "ttd_read_memory",
@@ -138,6 +142,12 @@ pub async fn call(registry: &mut SessionRegistry, call: ToolCall) -> anyhow::Res
             let request = parse::<CursorArg>(call.arguments)?;
             Ok(serde_json::to_value(
                 registry.registers(request.session_id, request.cursor_id)?,
+            )?)
+        }
+        "ttd_command_line" => {
+            let request = parse::<CursorArg>(call.arguments)?;
+            Ok(serde_json::to_value(
+                registry.command_line(request.session_id, request.cursor_id)?,
             )?)
         }
         "ttd_read_memory" => {

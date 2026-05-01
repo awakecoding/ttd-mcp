@@ -71,6 +71,24 @@ typedef struct TtdMcpExceptionInfo {
     uint64_t parameters[15];
 } TtdMcpExceptionInfo;
 
+typedef struct TtdMcpMemoryRead {
+    uint64_t address;
+    uint32_t bytes_read;
+    uint8_t complete;
+} TtdMcpMemoryRead;
+
+typedef struct TtdMcpCursorState {
+    TtdMcpPosition position;
+    TtdMcpPosition previous_position;
+    uint64_t thread_unique_id;
+    uint32_t thread_id;
+    uint64_t teb_address;
+    uint64_t program_counter;
+    uint64_t stack_pointer;
+    uint64_t frame_pointer;
+    uint64_t basic_return_value;
+} TtdMcpCursorState;
+
 typedef enum TtdMcpStatus {
     TTD_MCP_OK = 0,
     TTD_MCP_ERROR = 1,
@@ -88,6 +106,8 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_new_cursor(TtdMcpTrace* trace, TtdMcpCursor*
 TTD_MCP_EXPORT void ttd_mcp_free_cursor(TtdMcpCursor* cursor);
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_cursor_position(TtdMcpCursor* cursor, TtdMcpPosition* position);
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_set_position(TtdMcpCursor* cursor, TtdMcpPosition position);
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_read_memory(TtdMcpCursor* cursor, uint64_t address, uint8_t* buffer, uint32_t capacity, TtdMcpMemoryRead* result);
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_cursor_state(TtdMcpCursor* cursor, TtdMcpCursorState* state);
 TTD_MCP_EXPORT const char* ttd_mcp_last_error(void);
 
 #ifdef __cplusplus

@@ -79,6 +79,36 @@ pub struct CursorPosition {
     pub position: Position,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorThreadState {
+    pub unique_id: u64,
+    pub thread_id: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorRegisters {
+    pub session_id: u64,
+    pub cursor_id: u64,
+    pub position: Position,
+    pub previous_position: Option<Position>,
+    pub thread: Option<CursorThreadState>,
+    pub teb_address: Option<u64>,
+    pub program_counter: u64,
+    pub stack_pointer: u64,
+    pub frame_pointer: u64,
+    pub basic_return_value: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessCommandLine {
+    pub session_id: u64,
+    pub cursor_id: u64,
+    pub peb_address: u64,
+    pub process_parameters_address: u64,
+    pub command_line_address: u64,
+    pub command_line: String,
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct PositionRequest {
     pub session_id: u64,
@@ -120,6 +150,19 @@ pub struct ReadMemoryRequest {
     pub cursor_id: u64,
     pub address: u64,
     pub size: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadMemoryResponse {
+    pub session_id: u64,
+    pub cursor_id: u64,
+    pub requested_address: u64,
+    pub address: u64,
+    pub requested_size: u32,
+    pub bytes_read: usize,
+    pub complete: bool,
+    pub encoding: String,
+    pub data: String,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

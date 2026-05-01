@@ -27,7 +27,7 @@ Do not bind Rust directly to TTD C++ vtables, STL helper types, or C++ ownership
 
 ## Current Implementation State
 
-The Rust MCP server advertises tools and can use the native bridge for trace loading, trace metadata, thread/module/exception enumeration, cursor creation, and position get/set when `ttd_replay_bridge.dll` and TTD runtime DLLs are available. Registers, memory reads, stepping, and watchpoints still need native-backed implementations.
+The Rust MCP server advertises tools and can use the native bridge for trace loading, trace metadata, thread/module/exception enumeration, cursor creation, position get/set, core cursor register/thread state, bounded guest memory reads, and PEB-backed command-line extraction when `ttd_replay_bridge.dll` and TTD runtime DLLs are available. Stepping and watchpoints still need native-backed implementations.
 
 The current MCP transport is a small line-delimited JSON-RPC implementation in `crates/ttd-mcp/src/mcp.rs`. If strict MCP client compatibility becomes a priority, consider replacing or validating it against a Rust MCP SDK such as `rmcp` before expanding behavior heavily.
 
@@ -83,6 +83,8 @@ srv*.ttd-symbol-cache*https://msdl.microsoft.com/download/symbols
 
 ## Good Test Trace Target
 
+The repository keeps a small reusable sample trace as `traces/ping.7z`. Keep the archive trackable, but keep extracted trace contents under `traces/ping/` local-only and ignored. The ping integration test extracts `traces/ping.7z` automatically with `7z` or `7zz`; use `TTD_TEST_7Z` if the extractor is not on `PATH`.
+
 For a simple local TTD capture, prefer an in-box Windows executable with public symbols on the Microsoft symbol server. A good first target is:
 
 ```text
@@ -102,6 +104,7 @@ Close the program cleanly so TTD finalizes the `.run` and `.idx` files.
 ## Safety And Repository Hygiene
 
 - Treat `.run`, `.idx`, `.ttd`, `.pdb`, `.dll`, `.exe`, and other generated debugger artifacts as local-only unless the user explicitly asks otherwise.
+- Keep reusable test traces compressed as `.7z` archives; do not commit their extracted directories.
 - Do not commit downloaded Microsoft runtime binaries or captured traces.
 - Keep edits focused. Do not refactor unrelated Rust modules while wiring native replay.
 - Read current file contents before editing; this repo may have user or formatter edits between turns.
@@ -109,8 +112,8 @@ Close the program cleanly so TTD finalizes the `.run` and `.idx` files.
 
 ## Likely Next Implementation Steps
 
-1. Add register reads and memory reads through replay cursors.
-2. Add stepping/trace movement and memory watchpoint search.
-3. Expand module output with symbol loading details once symbolication is wired beyond raw module paths.
-4. Validate public PDB cache behavior end to end.
+1. Add stepping/trace movement and memory watchpoint search.
+2. Add full architecture-specific register contexts beyond the compact PC/SP/FP/TEB snapshot.
+3. Add process artifact helpers beyond command-line extraction, such as basic stack inspection.
+4. Expand module output with symbol loading details once symbolication is wired beyond raw module paths.
 5. Consider replacing or validating the custom JSON-RPC transport with a strict MCP SDK.

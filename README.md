@@ -14,7 +14,7 @@ This repository contains the first implementation slice:
 - A C ABI C++ bridge scaffold for the TTD Replay API.
 - Dependency/runtime acquisition scripts and architecture docs.
 
-The native bridge now builds with CMake and the Rust facade uses it when available for trace loading, trace metadata, thread/module/exception enumeration, cursor creation, and position get/set. Registers, memory reads, stepping, and watchpoints still need native-backed implementations.
+The native bridge now builds with CMake and the Rust facade uses it when available for trace loading, trace metadata, thread/module/exception enumeration, cursor creation, position get/set, core cursor register/thread state, bounded memory reads, and trace-derived command-line extraction from PEB process parameters. Stepping and watchpoints still need native-backed implementations.
 
 ## Build
 
@@ -70,7 +70,9 @@ TTD trace files can contain memory, file paths, registry data, and other sensiti
 
 ## Local Ping Trace Tests
 
-The first local end-to-end fixture is expected at `traces/ping`:
+The committed sample fixture is `traces/ping.7z`. The extracted `traces/ping` directory is ignored by git because it contains large and sensitive replay artifacts. The integration tests automatically extract the archive into `traces/` when the extracted fixture is missing and `7z` or `7zz` is available on `PATH`. If 7-Zip is installed somewhere else, set `TTD_TEST_7Z` to the executable path.
+
+After extraction, the fixture layout is:
 
 ```text
 traces/ping/ping01.run
@@ -78,11 +80,12 @@ traces/ping/ping01.idx
 traces/ping/ping.exe
 ```
 
-These artifacts are local-only and ignored by git. The Rust integration tests skip cleanly when the fixture is absent. Run strict local replay checks with:
+The extracted artifacts are local-only and ignored by git. The Rust integration tests skip cleanly when neither the extracted fixture nor a usable archive extractor is available. Run strict local replay checks with:
 
 ```powershell
-$env:TTD_TEST_TRACE = "D:\dev\ttd-mcp\traces\ping\ping01.run"
 $env:TTD_RUNTIME_DIR = "D:\dev\ttd-mcp\target\ttd-runtime"
 $env:TTD_MCP_EXPECT_NATIVE_REPLAY = "1"
 cargo test -p ttd-mcp --test ping_trace
 ```
+
+To force a custom trace instead of the committed archive fixture, set `TTD_TEST_TRACE` to a `.run` file path.

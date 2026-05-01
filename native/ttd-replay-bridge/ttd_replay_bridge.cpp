@@ -1,6 +1,7 @@
 #include "ttd_replay_bridge.h"
 
 #include <algorithm>
+#include <cstring>
 #include <cwchar>
 #include <iterator>
 #include <limits>
@@ -325,6 +326,57 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_set_position(TtdMcpCursor* cursor, TtdMcpPos
     cursor->cursor->SetPosition(to_replay_position(position));
     return TTD_MCP_OK;
 }
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_read_memory(TtdMcpCursor* cursor, uint64_t address, uint8_t* buffer, uint32_t capacity, TtdMcpMemoryRead* result) {
+    if (cursor == nullptr || buffer == nullptr || result == nullptr) {
+        set_error("cursor, buffer, and result pointers are required");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    if (capacity == 0) {
+        set_error("capacity must be greater than zero");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    std::scoped_lock lock(cursor->trace->mutex);
+    auto const memory = cursor->cursor->QueryMemoryBuffer(
+        static_cast<TTD::GuestAddress>(address),
+        TTD::BufferView(buffer, capacity));
+    size_t const bytes_read = std::min(static_cast<size_t>(capacity), memory.Memory.Size);
+    void const* const source = memory.Memory.BaseAddress;
+    if (source != nullptr && source != buffer && bytes_read > 0) {
+        std::memmove(buffer, source, bytes_read);
+    }
+
+    *result = TtdMcpMemoryRead{
+        static_cast<uint64_t>(memory.Address),
+        static_cast<uint32_t>(bytes_read),
+        memory.Address == static_cast<TTD::GuestAddress>(address) && bytes_read == capacity ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0),
+    };
+    return TTD_MCP_OK;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_cursor_state(TtdMcpCursor* cursor, TtdMcpCursorState* state) {
+    if (cursor == nullptr || state == nullptr) {
+        set_error("cursor and state pointers are required");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    std::scoped_lock lock(cursor->trace->mutex);
+    TTD::Replay::ThreadInfo const& thread = cursor->cursor->GetThreadInfo();
+    *state = TtdMcpCursorState{
+        to_bridge_position(cursor->cursor->GetPosition()),
+        to_bridge_position(cursor->cursor->GetPreviousPosition()),
+        static_cast<uint64_t>(thread.UniqueId),
+        static_cast<uint32_t>(thread.Id),
+        static_cast<uint64_t>(cursor->cursor->GetTebAddress()),
+        static_cast<uint64_t>(cursor->cursor->GetProgramCounter()),
+        static_cast<uint64_t>(cursor->cursor->GetStackPointer()),
+        static_cast<uint64_t>(cursor->cursor->GetFramePointer()),
+        cursor->cursor->GetBasicReturnValue(),
+    };
+    return TTD_MCP_OK;
+}
 #else
 struct TtdMcpTrace {};
 struct TtdMcpCursor {};
@@ -369,6 +421,16 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_cursor_position(TtdMcpCursor*, TtdMcpPositio
 }
 
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_set_position(TtdMcpCursor*, TtdMcpPosition) {
+    set_error("TTD replay bridge is not implemented in this build");
+    return TTD_MCP_NOT_IMPLEMENTED;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_read_memory(TtdMcpCursor*, uint64_t, uint8_t*, uint32_t, TtdMcpMemoryRead*) {
+    set_error("TTD replay bridge is not implemented in this build");
+    return TTD_MCP_NOT_IMPLEMENTED;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_cursor_state(TtdMcpCursor*, TtdMcpCursorState*) {
     set_error("TTD replay bridge is not implemented in this build");
     return TTD_MCP_NOT_IMPLEMENTED;
 }
