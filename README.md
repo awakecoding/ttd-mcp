@@ -8,7 +8,7 @@ The project is intentionally Windows-first. TTD replay uses Microsoft's TTD Repl
 
 This repository contains the first implementation slice:
 
-- A stdio MCP server in Rust.
+- A stdio MCP server in Rust using the official `rmcp` Rust MCP SDK.
 - Tool schemas for trace loading, metadata, cursors, seeking, registers, memory, and watchpoints.
 - A safe Rust replay facade with TTD position parsing and symbol-path handling.
 - A C ABI C++ bridge scaffold for the TTD Replay API.

@@ -1,5 +1,5 @@
 use anyhow::Context;
-use ttd_mcp::mcp::StdioTransport;
+use rmcp::{transport::stdio, ServiceExt};
 use ttd_mcp::server::TtdMcpServer;
 
 #[tokio::main]
@@ -13,8 +13,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let server = TtdMcpServer::default();
-    StdioTransport
-        .serve(server)
+    let service = server
+        .serve(stdio())
         .await
-        .context("stdio MCP transport failed")
+        .context("stdio MCP transport failed")?;
+    service
+        .waiting()
+        .await
+        .context("stdio MCP service failed")?;
+    Ok(())
 }

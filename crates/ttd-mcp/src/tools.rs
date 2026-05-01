@@ -3,9 +3,11 @@ use crate::ttd_replay::{
     PositionRequest, ReadMemoryRequest, SessionId, SessionRegistry, StepRequest,
 };
 use anyhow::{bail, Context};
+use rmcp::model::{JsonObject, Tool};
 use schemars::{schema_for, JsonSchema};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 #[derive(Debug, Deserialize)]
 pub struct ToolCall {
@@ -25,7 +27,7 @@ struct CursorArg {
     cursor_id: CursorId,
 }
 
-pub fn definitions() -> Vec<Value> {
+pub fn definitions() -> Vec<Tool> {
     vec![
         tool::<LoadTraceRequest>(
             "ttd_load_trace",
@@ -169,13 +171,21 @@ fn parse<T: for<'de> Deserialize<'de>>(value: Value) -> anyhow::Result<T> {
     serde_json::from_value(value).context("invalid tool arguments")
 }
 
-fn tool<T: JsonSchema>(name: &str, description: &str) -> Value {
+fn tool<T: JsonSchema>(name: &str, description: &str) -> Tool {
+    let input_schema = input_schema::<T>();
+    Tool::new(
+        name.to_string(),
+        description.to_string(),
+        Arc::new(input_schema),
+    )
+}
+
+fn input_schema<T: JsonSchema>() -> JsonObject {
     let input_schema = serde_json::to_value(schema_for!(T)).expect("tool schema is serializable");
-    json!({
-        "name": name,
-        "description": description,
-        "inputSchema": input_schema,
-    })
+    match input_schema {
+        Value::Object(object) => object,
+        _ => JsonObject::new(),
+    }
 }
 
 #[allow(dead_code)]

@@ -19,7 +19,7 @@ This project must use the Time Travel Debugging replay APIs, not the regular liv
 
 The intended layering is:
 
-1. Rust MCP transport, tool schemas, validation, session ids, and serialization.
+1. Rust MCP server over stdio using the official `rmcp` Rust MCP SDK, plus tool schemas, validation, session ids, and serialization.
 2. Safe Rust replay facade for traces, cursors, positions, modules, threads, exceptions, registers, memory reads, and watchpoints.
 3. Narrow C ABI C++ bridge over Microsoft's C++ TTD Replay API.
 
@@ -27,9 +27,7 @@ Do not bind Rust directly to TTD C++ vtables, STL helper types, or C++ ownership
 
 ## Current Implementation State
 
-The Rust MCP server advertises tools and can use the native bridge for trace loading, trace metadata, thread/module/exception enumeration, cursor creation, position get/set, core cursor register/thread state, bounded guest memory reads, and PEB-backed command-line extraction when `ttd_replay_bridge.dll` and TTD runtime DLLs are available. Stepping and watchpoints still need native-backed implementations.
-
-The current MCP transport is a small line-delimited JSON-RPC implementation in `crates/ttd-mcp/src/mcp.rs`. If strict MCP client compatibility becomes a priority, consider replacing or validating it against a Rust MCP SDK such as `rmcp` before expanding behavior heavily.
+The Rust MCP server uses `rmcp` for stdio MCP protocol handling, advertises tools, and can use the native bridge for trace loading, trace metadata, thread/module/exception enumeration, cursor creation, position get/set, core cursor register/thread state, bounded guest memory reads, and PEB-backed command-line extraction when `ttd_replay_bridge.dll` and TTD runtime DLLs are available. Stepping and watchpoints still need native-backed implementations.
 
 ## Build And Check Commands
 
@@ -116,4 +114,4 @@ Close the program cleanly so TTD finalizes the `.run` and `.idx` files.
 2. Add full architecture-specific register contexts beyond the compact PC/SP/FP/TEB snapshot.
 3. Add process artifact helpers beyond command-line extraction, such as basic stack inspection.
 4. Expand module output with symbol loading details once symbolication is wired beyond raw module paths.
-5. Consider replacing or validating the custom JSON-RPC transport with a strict MCP SDK.
+5. Expand black-box MCP stdio tests alongside new replay-backed tool behavior.

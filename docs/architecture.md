@@ -4,7 +4,7 @@
 
 The server is split into three layers:
 
-1. Rust MCP server over stdio. This owns JSON-RPC handling, tool schemas, session ids, validation, symbol-path settings, and packaging workflow.
+1. Rust MCP server over stdio using the official `rmcp` Rust MCP SDK. This owns MCP protocol transport, tool schemas, session ids, validation, symbol-path settings, and packaging workflow.
 2. Safe Rust replay facade. This keeps TTD positions, sessions, cursors, memory reads, modules, threads, and exceptions in serializable Rust types.
 3. Native C++ replay bridge. This is a narrow C ABI over Microsoft's C++ TTD Replay API from `Microsoft.TimeTravelDebugging.Apis`.
 
@@ -45,4 +45,4 @@ The Rust facade resolves caller settings into a process-local symbol configurati
 
 ## Current State
 
-The Rust MCP server and native bridge boundary are scaffolded, built, and wired for the first native replay slices. The server can advertise tools, validate inputs, load a trace through `ttd_mcp_open_trace`, read `ttd_mcp_trace_info`, enumerate threads/modules/exceptions, create cursors, get/set cursor positions, read core cursor register/thread state, read bounded guest memory at a cursor, and extract the process command line from PEB process parameters. The next implementation step is to add native-backed stepping and watchpoint replay.
+The Rust MCP server uses `rmcp` for stdio MCP protocol handling, and the native bridge boundary is scaffolded, built, and wired for the first native replay slices. The server can advertise tools, validate inputs, load a trace through `ttd_mcp_open_trace`, read `ttd_mcp_trace_info`, enumerate threads/modules/exceptions, create cursors, get/set cursor positions, read core cursor register/thread state, read bounded guest memory at a cursor, and extract the process command line from PEB process parameters. The next implementation step is to add native-backed stepping and watchpoint replay.
