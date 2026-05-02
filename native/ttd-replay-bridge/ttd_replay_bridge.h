@@ -233,12 +233,14 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_new_cursor(TtdMcpTrace* trace, TtdMcpCursor*
 TTD_MCP_EXPORT void ttd_mcp_free_cursor(TtdMcpCursor* cursor);
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_cursor_position(TtdMcpCursor* cursor, TtdMcpPosition* position);
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_set_position(TtdMcpCursor* cursor, TtdMcpPosition position);
-TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_read_memory(TtdMcpCursor* cursor, uint64_t address, uint8_t* buffer, uint32_t capacity, TtdMcpMemoryRead* result);
-TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_query_memory_range(TtdMcpCursor* cursor, uint64_t address, uint8_t* buffer, uint32_t capacity, TtdMcpMemoryRangeInfo* result);
-TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_query_memory_buffer_with_ranges(TtdMcpCursor* cursor, uint64_t address, uint8_t* buffer, uint32_t capacity, TtdMcpMemoryBufferRangeInfo* ranges, uint32_t range_capacity, TtdMcpMemoryBufferInfo* result);
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_set_position_on_thread(TtdMcpCursor* cursor, uint32_t thread_unique_id, TtdMcpPosition position);
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_read_memory(TtdMcpCursor* cursor, uint64_t address, uint8_t* buffer, uint32_t capacity, uint32_t policy, TtdMcpMemoryRead* result);
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_query_memory_range(TtdMcpCursor* cursor, uint64_t address, uint8_t* buffer, uint32_t capacity, uint32_t policy, TtdMcpMemoryRangeInfo* result);
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_query_memory_buffer_with_ranges(TtdMcpCursor* cursor, uint64_t address, uint8_t* buffer, uint32_t capacity, TtdMcpMemoryBufferRangeInfo* ranges, uint32_t range_capacity, uint32_t policy, TtdMcpMemoryBufferInfo* result);
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_cursor_state(TtdMcpCursor* cursor, TtdMcpCursorState* state);
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_x64_context(TtdMcpCursor* cursor, uint32_t thread_id, TtdMcpX64Context* context);
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_active_threads(TtdMcpCursor* cursor, TtdMcpActiveThreadInfo* threads, uint32_t capacity, uint32_t* count);
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_cursor_modules(TtdMcpCursor* cursor, TtdMcpModuleInfo* modules, uint32_t capacity, uint32_t* count);
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_step_cursor(TtdMcpCursor* cursor, uint32_t direction, uint32_t count, uint8_t only_current_thread, TtdMcpStepResult* result);
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_memory_watchpoint(TtdMcpCursor* cursor, uint64_t address, uint32_t size, uint32_t access_mask, uint32_t direction, TtdMcpMemoryWatchpointResult* result);
 TTD_MCP_EXPORT const char* ttd_mcp_last_error(void);

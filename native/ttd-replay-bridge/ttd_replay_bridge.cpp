@@ -150,6 +150,32 @@ bool to_data_access_mask(uint32_t value, TTD::Replay::DataAccessMask* access_mas
         return false;
     }
 }
+
+bool to_query_memory_policy(uint32_t value, TTD::Replay::QueryMemoryPolicy* policy) noexcept {
+    if (policy == nullptr) {
+        return false;
+    }
+
+    switch (value) {
+    case 0:
+        *policy = TTD::Replay::QueryMemoryPolicy::Default;
+        return true;
+    case 1:
+        *policy = TTD::Replay::QueryMemoryPolicy::ThreadLocal;
+        return true;
+    case 2:
+        *policy = TTD::Replay::QueryMemoryPolicy::GloballyConservative;
+        return true;
+    case 3:
+        *policy = TTD::Replay::QueryMemoryPolicy::GloballyAggressive;
+        return true;
+    case 4:
+        *policy = TTD::Replay::QueryMemoryPolicy::InFragmentAggressive;
+        return true;
+    default:
+        return false;
+    }
+}
 }
 
 struct TtdMcpTrace {
@@ -486,7 +512,24 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_set_position(TtdMcpCursor* cursor, TtdMcpPos
     return TTD_MCP_OK;
 }
 
-TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_read_memory(TtdMcpCursor* cursor, uint64_t address, uint8_t* buffer, uint32_t capacity, TtdMcpMemoryRead* result) {
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_set_position_on_thread(TtdMcpCursor* cursor, uint32_t thread_unique_id, TtdMcpPosition position) {
+    if (cursor == nullptr) {
+        set_error("cursor pointer is required");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    if (thread_unique_id == 0) {
+        set_error("thread_unique_id must be non-zero");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    cursor->cursor->SetPositionOnThread(
+        static_cast<TTD::Replay::UniqueThreadId>(thread_unique_id),
+        to_replay_position(position));
+    return TTD_MCP_OK;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_read_memory(TtdMcpCursor* cursor, uint64_t address, uint8_t* buffer, uint32_t capacity, uint32_t policy, TtdMcpMemoryRead* result) {
     if (cursor == nullptr || buffer == nullptr || result == nullptr) {
         set_error("cursor, buffer, and result pointers are required");
         return TTD_MCP_INVALID_ARGUMENT;
@@ -497,10 +540,17 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_read_memory(TtdMcpCursor* cursor, uint64_t a
         return TTD_MCP_INVALID_ARGUMENT;
     }
 
+    TTD::Replay::QueryMemoryPolicy memory_policy = TTD::Replay::QueryMemoryPolicy::Default;
+    if (!to_query_memory_policy(policy, &memory_policy)) {
+        set_error("invalid query memory policy");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
     std::scoped_lock lock(cursor->trace->mutex);
     auto const memory = cursor->cursor->QueryMemoryBuffer(
         static_cast<TTD::GuestAddress>(address),
-        TTD::BufferView(buffer, capacity));
+        TTD::BufferView(buffer, capacity),
+        memory_policy);
     size_t const bytes_read = std::min(static_cast<size_t>(capacity), memory.Memory.Size);
     void const* const source = memory.Memory.BaseAddress;
     if (source != nullptr && source != buffer && bytes_read > 0) {
@@ -515,7 +565,7 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_read_memory(TtdMcpCursor* cursor, uint64_t a
     return TTD_MCP_OK;
 }
 
-TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_query_memory_range(TtdMcpCursor* cursor, uint64_t address, uint8_t* buffer, uint32_t capacity, TtdMcpMemoryRangeInfo* result) {
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_query_memory_range(TtdMcpCursor* cursor, uint64_t address, uint8_t* buffer, uint32_t capacity, uint32_t policy, TtdMcpMemoryRangeInfo* result) {
     if (cursor == nullptr || result == nullptr) {
         set_error("cursor and result pointers are required");
         return TTD_MCP_INVALID_ARGUMENT;
@@ -531,8 +581,14 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_query_memory_range(TtdMcpCursor* cursor, uin
         return TTD_MCP_INVALID_ARGUMENT;
     }
 
+    TTD::Replay::QueryMemoryPolicy memory_policy = TTD::Replay::QueryMemoryPolicy::Default;
+    if (!to_query_memory_policy(policy, &memory_policy)) {
+        set_error("invalid query memory policy");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
     std::scoped_lock lock(cursor->trace->mutex);
-    auto const memory = cursor->cursor->QueryMemoryRange(static_cast<TTD::GuestAddress>(address));
+    auto const memory = cursor->cursor->QueryMemoryRange(static_cast<TTD::GuestAddress>(address), memory_policy);
     size_t const bytes_available = memory.Memory.Size;
     size_t const bytes_copied = std::min(static_cast<size_t>(capacity), bytes_available);
     if (buffer != nullptr && memory.Memory.BaseAddress != nullptr && bytes_copied > 0) {
@@ -549,7 +605,7 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_query_memory_range(TtdMcpCursor* cursor, uin
     return TTD_MCP_OK;
 }
 
-TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_query_memory_buffer_with_ranges(TtdMcpCursor* cursor, uint64_t address, uint8_t* buffer, uint32_t capacity, TtdMcpMemoryBufferRangeInfo* ranges, uint32_t range_capacity, TtdMcpMemoryBufferInfo* result) {
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_query_memory_buffer_with_ranges(TtdMcpCursor* cursor, uint64_t address, uint8_t* buffer, uint32_t capacity, TtdMcpMemoryBufferRangeInfo* ranges, uint32_t range_capacity, uint32_t policy, TtdMcpMemoryBufferInfo* result) {
     if (cursor == nullptr || buffer == nullptr || result == nullptr) {
         set_error("cursor, buffer, and result pointers are required");
         return TTD_MCP_INVALID_ARGUMENT;
@@ -570,13 +626,20 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_query_memory_buffer_with_ranges(TtdMcpCursor
         return TTD_MCP_INVALID_ARGUMENT;
     }
 
+    TTD::Replay::QueryMemoryPolicy memory_policy = TTD::Replay::QueryMemoryPolicy::Default;
+    if (!to_query_memory_policy(policy, &memory_policy)) {
+        set_error("invalid query memory policy");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
     std::scoped_lock lock(cursor->trace->mutex);
     std::vector<TTD::Replay::MemoryRange> native_ranges(range_capacity);
     auto const memory = cursor->cursor->QueryMemoryBufferWithRanges(
         static_cast<TTD::GuestAddress>(address),
         TTD::BufferView(buffer, capacity),
         native_ranges.size(),
-        native_ranges.data());
+        native_ranges.data(),
+        memory_policy);
 
     size_t const bytes_read = std::min(static_cast<size_t>(capacity), memory.Memory.Size);
     void const* const source = memory.Memory.BaseAddress;
@@ -759,6 +822,41 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_active_threads(TtdMcpCursor* cursor, TtdMcpA
     return TTD_MCP_OK;
 }
 
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_cursor_modules(TtdMcpCursor* cursor, TtdMcpModuleInfo* modules, uint32_t capacity, uint32_t* count) {
+    if (cursor == nullptr || count == nullptr) {
+        set_error("cursor and count pointers are required");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    if (capacity > 0 && modules == nullptr) {
+        set_error("output buffer is required when capacity is non-zero");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    std::scoped_lock lock(cursor->trace->mutex);
+    size_t const required = cursor->cursor->GetModuleCount();
+    TtdMcpStatus const count_status = set_required_count(required, count);
+    if (count_status != TTD_MCP_OK) {
+        return count_status;
+    }
+
+    if (capacity < required) {
+        return TTD_MCP_OK;
+    }
+
+    TTD::Replay::ModuleInstance const* const source = cursor->cursor->GetModuleList();
+    for (size_t index = 0; index < required; ++index) {
+        TTD::Replay::ModuleInstance const& instance = source[index];
+        TtdMcpModuleInfo output = to_bridge_module(instance.pModule);
+        output.load_position = to_bridge_position(instance.LoadTime);
+        output.unload_position = to_bridge_position(instance.UnloadTime);
+        output.has_unload_position = is_valid_sequence(instance.UnloadTime) ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+        modules[index] = output;
+    }
+
+    return TTD_MCP_OK;
+}
+
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_step_cursor(TtdMcpCursor* cursor, uint32_t direction, uint32_t count, uint8_t only_current_thread, TtdMcpStepResult* result) {
     if (cursor == nullptr || result == nullptr) {
         set_error("cursor and result pointers are required");
@@ -928,17 +1026,22 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_set_position(TtdMcpCursor*, TtdMcpPosition) 
     return TTD_MCP_NOT_IMPLEMENTED;
 }
 
-TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_read_memory(TtdMcpCursor*, uint64_t, uint8_t*, uint32_t, TtdMcpMemoryRead*) {
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_set_position_on_thread(TtdMcpCursor*, uint32_t, TtdMcpPosition) {
     set_error("TTD replay bridge is not implemented in this build");
     return TTD_MCP_NOT_IMPLEMENTED;
 }
 
-TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_query_memory_range(TtdMcpCursor*, uint64_t, uint8_t*, uint32_t, TtdMcpMemoryRangeInfo*) {
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_read_memory(TtdMcpCursor*, uint64_t, uint8_t*, uint32_t, uint32_t, TtdMcpMemoryRead*) {
     set_error("TTD replay bridge is not implemented in this build");
     return TTD_MCP_NOT_IMPLEMENTED;
 }
 
-TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_query_memory_buffer_with_ranges(TtdMcpCursor*, uint64_t, uint8_t*, uint32_t, TtdMcpMemoryBufferRangeInfo*, uint32_t, TtdMcpMemoryBufferInfo*) {
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_query_memory_range(TtdMcpCursor*, uint64_t, uint8_t*, uint32_t, uint32_t, TtdMcpMemoryRangeInfo*) {
+    set_error("TTD replay bridge is not implemented in this build");
+    return TTD_MCP_NOT_IMPLEMENTED;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_query_memory_buffer_with_ranges(TtdMcpCursor*, uint64_t, uint8_t*, uint32_t, TtdMcpMemoryBufferRangeInfo*, uint32_t, uint32_t, TtdMcpMemoryBufferInfo*) {
     set_error("TTD replay bridge is not implemented in this build");
     return TTD_MCP_NOT_IMPLEMENTED;
 }
@@ -954,6 +1057,11 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_x64_context(TtdMcpCursor*, uint32_t, TtdMcpX
 }
 
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_active_threads(TtdMcpCursor*, TtdMcpActiveThreadInfo*, uint32_t, uint32_t*) {
+    set_error("TTD replay bridge is not implemented in this build");
+    return TTD_MCP_NOT_IMPLEMENTED;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_cursor_modules(TtdMcpCursor*, TtdMcpModuleInfo*, uint32_t, uint32_t*) {
     set_error("TTD replay bridge is not implemented in this build");
     return TTD_MCP_NOT_IMPLEMENTED;
 }

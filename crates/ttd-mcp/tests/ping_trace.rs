@@ -7,9 +7,9 @@ use common::{
 use ttd_mcp::ttd_replay::{
     AddressClassification, AddressInfoRequest, LoadTraceRequest, MemoryAccessDirection,
     MemoryAccessMask, MemoryBufferRequest, MemoryRangeRequest, MemoryWatchpointRequest,
-    ModuleInfoRequest, Position, PositionOrPercent, PositionRequest, ReadMemoryRequest,
-    RegisterContextRequest, SessionRegistry, StackReadRequest, StepDirection, StepKind,
-    StepRequest, TraceInfo,
+    ModuleInfoRequest, Position, PositionOrPercent, PositionRequest, QueryMemoryPolicy,
+    ReadMemoryRequest, RegisterContextRequest, SessionRegistry, StackReadRequest, StepDirection,
+    StepKind, StepRequest, TraceInfo,
 };
 
 #[test]
@@ -93,6 +93,7 @@ fn loads_ping_trace_fixture_and_exercises_cursor_path() -> anyhow::Result<()> {
             session_id: loaded.session_id,
             cursor_id: cursor.cursor_id,
             position: PositionOrPercent::Position(info.lifetime_end),
+            thread_unique_id: None,
         })?
         .position;
     assert_eq!(end_position, info.lifetime_end);
@@ -102,6 +103,7 @@ fn loads_ping_trace_fixture_and_exercises_cursor_path() -> anyhow::Result<()> {
             session_id: loaded.session_id,
             cursor_id: cursor.cursor_id,
             position: PositionOrPercent::Percent(50),
+            thread_unique_id: None,
         })?
         .position;
     assert_position_in_range(midpoint, info.lifetime_start, info.lifetime_end);
@@ -123,21 +125,37 @@ fn loads_ping_trace_fixture_and_exercises_cursor_path() -> anyhow::Result<()> {
         ensure!(
             capabilities.features.module_info
                 && capabilities.features.address_info
+                && capabilities.features.cursor_modules
                 && capabilities.features.list_keyframes
                 && capabilities.features.module_events
                 && capabilities.features.thread_events
                 && capabilities.features.active_threads
                 && capabilities.features.stack_info
                 && capabilities.features.stack_read,
-            "native replay should advertise address, module, event, keyframe, active thread, and stack helper support"
+            "native replay should advertise address, module, cursor module, event, keyframe, active thread, and stack helper support"
         );
         ensure!(
             capabilities.features.memory_range && capabilities.features.memory_buffer_ranges,
             "native replay should advertise trace-backed memory range and buffer provenance support"
         );
+        ensure!(
+            capabilities.features.memory_query_policy,
+            "native replay should advertise selectable memory query policies"
+        );
+        ensure!(
+            capabilities.features.position_set_thread,
+            "native replay should advertise thread-scoped position setting"
+        );
         assert_native_lists(&registry, loaded.session_id, &info)?;
+        assert_native_position_on_thread(
+            &mut registry,
+            loaded.session_id,
+            cursor.cursor_id,
+            &info,
+        )?;
         assert_native_timeline_lists(&registry, loaded.session_id, &info)?;
         assert_native_module_info(&registry, loaded.session_id)?;
+        assert_native_cursor_modules(&registry, loaded.session_id, cursor.cursor_id)?;
         assert_native_address_info(&registry, loaded.session_id, cursor.cursor_id)?;
         assert_native_active_threads(&registry, loaded.session_id, cursor.cursor_id, &info)?;
         assert_native_registers(&registry, loaded.session_id, cursor.cursor_id)?;
@@ -421,6 +439,61 @@ fn assert_native_module_info(registry: &SessionRegistry, session_id: u64) -> any
     Ok(())
 }
 
+fn assert_native_position_on_thread(
+    registry: &mut SessionRegistry,
+    session_id: u64,
+    cursor_id: u64,
+    info: &TraceInfo,
+) -> anyhow::Result<()> {
+    let thread = registry
+        .list_threads(session_id)?
+        .into_iter()
+        .find(|thread| thread.unique_id != 0)
+        .context("native trace should include a non-zero unique thread id")?;
+    let positioned = registry.set_position(PositionRequest {
+        session_id,
+        cursor_id,
+        position: PositionOrPercent::Percent(50),
+        thread_unique_id: Some(thread.unique_id),
+    })?;
+    assert_position_in_range(positioned.position, info.lifetime_start, info.lifetime_end);
+
+    let registers = registry.registers(session_id, cursor_id)?;
+    ensure!(
+        registers
+            .thread
+            .as_ref()
+            .is_some_and(|current| current.unique_id == thread.unique_id),
+        "thread-scoped position_set should select the requested unique thread id: {:?}",
+        registers
+    );
+
+    Ok(())
+}
+
+fn assert_native_cursor_modules(
+    registry: &SessionRegistry,
+    session_id: u64,
+    cursor_id: u64,
+) -> anyhow::Result<()> {
+    let current = registry.cursor_position(session_id, cursor_id)?;
+    let modules = registry.cursor_modules(session_id, cursor_id)?;
+    ensure!(
+        modules.position == current.position,
+        "cursor_modules should echo current cursor position"
+    );
+    ensure!(
+        modules
+            .modules
+            .iter()
+            .any(|module| module.name.eq_ignore_ascii_case("ping.exe")),
+        "cursor_modules should include ping.exe at the cursor position: {:?}",
+        modules
+    );
+
+    Ok(())
+}
+
 fn assert_native_address_info(
     registry: &SessionRegistry,
     session_id: u64,
@@ -578,6 +651,7 @@ fn assert_native_memory_read(
         cursor_id,
         address: peb_address,
         size: 64,
+        policy: Some(QueryMemoryPolicy::GloballyConservative),
     })?;
 
     ensure!(
@@ -592,6 +666,12 @@ fn assert_native_memory_read(
     ensure!(
         memory.data.len() == memory.bytes_read * 2,
         "hex payload length should match bytes read"
+    );
+
+    ensure!(
+        memory.policy == QueryMemoryPolicy::GloballyConservative,
+        "PEB memory read should echo the requested memory policy: {:?}",
+        memory
     );
 
     Ok(())
@@ -612,6 +692,7 @@ fn assert_native_memory_range(
         cursor_id,
         address: module.module.base_address,
         max_bytes: 64,
+        policy: Some(QueryMemoryPolicy::GloballyConservative),
     })?;
 
     ensure!(
@@ -627,6 +708,11 @@ fn assert_native_memory_range(
     ensure!(
         range.data.len() == range.bytes_returned * 2,
         "memory range hex payload length should match returned bytes"
+    );
+    ensure!(
+        range.policy == QueryMemoryPolicy::GloballyConservative,
+        "memory range should echo the requested memory policy: {:?}",
+        range
     );
     ensure!(
         range
@@ -656,6 +742,7 @@ fn assert_native_memory_buffer(
         address: module.module.base_address,
         size: 64,
         max_ranges: 8,
+        policy: Some(QueryMemoryPolicy::GloballyAggressive),
     })?;
 
     ensure!(
@@ -671,6 +758,11 @@ fn assert_native_memory_buffer(
     ensure!(
         !memory.ranges.is_empty(),
         "memory buffer should include source ranges: {:?}",
+        memory
+    );
+    ensure!(
+        memory.policy == QueryMemoryPolicy::GloballyAggressive,
+        "memory buffer should echo the requested memory policy: {:?}",
         memory
     );
     ensure!(
@@ -767,6 +859,7 @@ fn assert_native_memory_watchpoint(
         session_id,
         cursor_id,
         position: PositionOrPercent::Position(info.lifetime_end),
+        thread_unique_id: None,
     })?;
 
     let watchpoint = registry.memory_watchpoint(MemoryWatchpointRequest {
@@ -824,6 +917,7 @@ fn assert_native_memory_watchpoint(
         session_id,
         cursor_id,
         position: PositionOrPercent::Position(info.lifetime_start),
+        thread_unique_id: None,
     })?;
     let no_hit = registry.memory_watchpoint(MemoryWatchpointRequest {
         session_id,

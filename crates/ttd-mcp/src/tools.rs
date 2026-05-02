@@ -52,6 +52,10 @@ pub fn definitions() -> Vec<Tool> {
             "ttd_list_modules",
             "List modules and module instances captured in a loaded TTD trace.",
         ),
+        tool::<CursorArg>(
+            "ttd_cursor_modules",
+            "List modules loaded at a replay cursor position.",
+        ),
         tool::<SessionArg>(
             "ttd_list_keyframes",
             "List replay keyframe positions captured in a loaded TTD trace.",
@@ -90,7 +94,7 @@ pub fn definitions() -> Vec<Tool> {
         ),
         tool::<PositionRequest>(
             "ttd_position_set",
-            "Move a replay cursor to a HEX:HEX position or approximate percent.",
+            "Move a replay cursor to a HEX:HEX position, approximate percent, or nearest position on a TTD unique thread.",
         ),
         tool::<StepRequest>(
             "ttd_step",
@@ -168,6 +172,12 @@ pub async fn call(registry: &mut SessionRegistry, call: ToolCall) -> anyhow::Res
             let request = parse::<SessionArg>(call.arguments)?;
             Ok(serde_json::to_value(
                 registry.list_modules(request.session_id)?,
+            )?)
+        }
+        "ttd_cursor_modules" => {
+            let request = parse::<CursorArg>(call.arguments)?;
+            Ok(serde_json::to_value(
+                registry.cursor_modules(request.session_id, request.cursor_id)?,
             )?)
         }
         "ttd_list_keyframes" => {

@@ -27,7 +27,7 @@ Do not bind Rust directly to TTD C++ vtables, STL helper types, or C++ ownership
 
 ## Current Implementation State
 
-The Rust MCP server uses `rmcp` for stdio MCP protocol handling, advertises tools, and can use the native bridge for trace loading, trace metadata, thread/module/exception/keyframe enumeration, module and thread lifecycle event timelines, cursor creation, position get/set, active-thread snapshots, stepping/tracing, compact and x64 scalar/SIMD cursor register/thread state, bounded guest memory reads, trace-backed memory range and buffer provenance queries, memory watchpoint replay, and PEB-backed command-line extraction when `ttd_replay_bridge.dll` and TTD runtime DLLs are available.
+The Rust MCP server uses `rmcp` for stdio MCP protocol handling, advertises tools, and can use the native bridge for trace loading, trace metadata, thread/module/exception/keyframe enumeration, cursor-local module snapshots, module and thread lifecycle event timelines, cursor creation, position get/set including TTD thread-scoped seeking, active-thread snapshots, stepping/tracing, compact and x64 scalar/SIMD cursor register/thread state, bounded guest memory reads with selectable TTD query policies, trace-backed memory range and buffer provenance queries, memory watchpoint replay, and PEB-backed command-line extraction when `ttd_replay_bridge.dll` and TTD runtime DLLs are available.
 
 ## Build And Check Commands
 

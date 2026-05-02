@@ -241,6 +241,24 @@ fn ping_trace_replay_scenario_over_mcp_stdio() -> anyhow::Result<()> {
         "native MCP module list should include ping.exe: {modules}"
     );
 
+    let cursor_modules = client.call_tool_json(
+        56,
+        "ttd_cursor_modules",
+        json!({
+            "session_id": session_id,
+            "cursor_id": cursor_id,
+        }),
+    )?;
+    ensure!(
+        cursor_modules["position"].is_object()
+            && cursor_modules["modules"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|module| module["name"]
+                    .as_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("ping.exe")))),
+        "cursor_modules should include modules loaded at the cursor position: {cursor_modules}"
+    );
+
     let keyframes = client.call_tool_json(
         49,
         "ttd_list_keyframes",
@@ -374,6 +392,24 @@ fn ping_trace_replay_scenario_over_mcp_stdio() -> anyhow::Result<()> {
         "active_threads should include runtime PCs: {active_threads}"
     );
 
+    let active_thread_unique_id = active_threads["threads"][0]["thread"]["unique_id"]
+        .as_u64()
+        .context("active_threads should include a unique thread id")?;
+    let thread_position = client.call_tool_json(
+        57,
+        "ttd_position_set",
+        json!({
+            "session_id": session_id,
+            "cursor_id": cursor_id,
+            "position": 50,
+            "thread_unique_id": active_thread_unique_id,
+        }),
+    )?;
+    ensure!(
+        thread_position["position"].is_object(),
+        "thread-scoped position_set should return the resolved cursor position: {thread_position}"
+    );
+
     let registers = client.call_tool_json(
         36,
         "ttd_registers",
@@ -393,6 +429,10 @@ fn ping_trace_replay_scenario_over_mcp_stdio() -> anyhow::Result<()> {
             .as_u64()
             .is_some_and(|value| value != 0),
         "register snapshot should include a non-zero stack pointer: {registers}"
+    );
+    ensure!(
+        registers["thread"]["unique_id"] == active_thread_unique_id,
+        "thread-scoped position_set should select the requested unique thread id: {registers}"
     );
 
     let register_context = client.call_tool_json(
@@ -540,8 +580,13 @@ fn ping_trace_replay_scenario_over_mcp_stdio() -> anyhow::Result<()> {
             "cursor_id": cursor_id,
             "address": peb_address,
             "size": 64,
+            "policy": "globally_conservative",
         }),
     )?;
+    ensure!(
+        memory["policy"] == "globally_conservative",
+        "PEB memory read should echo the requested query policy: {memory}"
+    );
     ensure!(
         memory["bytes_read"]
             .as_u64()
@@ -561,8 +606,13 @@ fn ping_trace_replay_scenario_over_mcp_stdio() -> anyhow::Result<()> {
             "cursor_id": cursor_id,
             "address": ping_base,
             "max_bytes": 64,
+            "policy": "globally_conservative",
         }),
     )?;
+    ensure!(
+        memory_range["policy"] == "globally_conservative",
+        "memory_range should echo the requested query policy: {memory_range}"
+    );
     ensure!(
         memory_range["bytes_available"]
             .as_u64()
@@ -592,8 +642,13 @@ fn ping_trace_replay_scenario_over_mcp_stdio() -> anyhow::Result<()> {
             "address": ping_base,
             "size": 64,
             "max_ranges": 8,
+            "policy": "globally_aggressive",
         }),
     )?;
+    ensure!(
+        memory_buffer["policy"] == "globally_aggressive",
+        "memory_buffer should echo the requested query policy: {memory_buffer}"
+    );
     ensure!(
         memory_buffer["bytes_read"]
             .as_u64()
@@ -817,6 +872,7 @@ fn expected_tool_names() -> &'static [&'static str] {
         "ttd_capabilities",
         "ttd_list_threads",
         "ttd_list_modules",
+        "ttd_cursor_modules",
         "ttd_list_keyframes",
         "ttd_module_events",
         "ttd_thread_events",
@@ -890,6 +946,7 @@ fn required_args_for_tool(name: &str) -> anyhow::Result<&'static [&'static str]>
         | "ttd_registers"
         | "ttd_register_context"
         | "ttd_active_threads"
+        | "ttd_cursor_modules"
         | "ttd_stack_info"
         | "ttd_command_line" => Ok(&["session_id", "cursor_id"]),
         "ttd_address_info" => Ok(&["session_id", "cursor_id", "address"]),

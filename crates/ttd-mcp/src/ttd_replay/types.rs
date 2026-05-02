@@ -52,6 +52,7 @@ pub struct ReplayCapabilities {
     pub close_trace: bool,
     pub list_threads: bool,
     pub list_modules: bool,
+    pub cursor_modules: bool,
     pub list_keyframes: bool,
     pub module_events: bool,
     pub thread_events: bool,
@@ -62,6 +63,7 @@ pub struct ReplayCapabilities {
     pub cursor_create: bool,
     pub position_get: bool,
     pub position_set: bool,
+    pub position_set_thread: bool,
     pub step: bool,
     pub compact_registers: bool,
     pub full_registers: bool,
@@ -70,6 +72,7 @@ pub struct ReplayCapabilities {
     pub stack_read: bool,
     pub command_line: bool,
     pub read_memory: bool,
+    pub memory_query_policy: bool,
     pub memory_range: bool,
     pub memory_buffer_ranges: bool,
     pub memory_watchpoint: bool,
@@ -106,6 +109,14 @@ pub struct TraceModule {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleList {
+    pub modules: Vec<TraceModule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorModuleList {
+    pub session_id: u64,
+    pub cursor_id: u64,
+    pub position: Position,
     pub modules: Vec<TraceModule>,
 }
 
@@ -384,6 +395,8 @@ pub struct MemoryRangeRequest {
     pub address: u64,
     #[serde(default = "default_memory_range_max_bytes")]
     pub max_bytes: u32,
+    #[serde(default)]
+    pub policy: Option<QueryMemoryPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,6 +409,7 @@ pub struct MemoryRangeResponse {
     pub bytes_available: u64,
     pub bytes_returned: usize,
     pub complete: bool,
+    pub policy: QueryMemoryPolicy,
     pub encoding: String,
     pub data: String,
     pub module: Option<AddressModuleCoordinate>,
@@ -409,6 +423,8 @@ pub struct MemoryBufferRequest {
     pub size: u32,
     #[serde(default = "default_memory_buffer_max_ranges")]
     pub max_ranges: u32,
+    #[serde(default)]
+    pub policy: Option<QueryMemoryPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -421,6 +437,7 @@ pub struct MemoryBufferResponse {
     pub bytes_read: usize,
     pub complete: bool,
     pub ranges_truncated: bool,
+    pub policy: QueryMemoryPolicy,
     pub encoding: String,
     pub data: String,
     pub ranges: Vec<MemoryBufferRange>,
@@ -501,6 +518,8 @@ pub struct PositionRequest {
     pub session_id: u64,
     pub cursor_id: u64,
     pub position: PositionOrPercent,
+    #[serde(default)]
+    pub thread_unique_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -552,6 +571,8 @@ pub struct ReadMemoryRequest {
     pub cursor_id: u64,
     pub address: u64,
     pub size: u32,
+    #[serde(default)]
+    pub policy: Option<QueryMemoryPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -563,8 +584,20 @@ pub struct ReadMemoryResponse {
     pub requested_size: u32,
     pub bytes_read: usize,
     pub complete: bool,
+    pub policy: QueryMemoryPolicy,
     pub encoding: String,
     pub data: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryMemoryPolicy {
+    #[default]
+    Default,
+    ThreadLocal,
+    GloballyConservative,
+    GloballyAggressive,
+    InFragmentAggressive,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

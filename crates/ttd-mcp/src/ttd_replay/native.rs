@@ -1,10 +1,10 @@
 use super::types::{
     ActiveThreadState, CursorRegisters, CursorThreadState, MemoryAccessDirection, MemoryAccessKind,
     MemoryAccessMask, MemoryBufferRange, MemoryBufferResponse, MemoryRangeResponse,
-    MemoryWatchpointResponse, ModuleEventKind, ReadMemoryResponse, RegisterContextResponse,
-    StepDirection, StepKind, StepResult, ThreadEventKind, TraceException, TraceModule,
-    TraceModuleEvent, TraceThread, TraceThreadEvent, VectorRegister128, VectorRegister256,
-    X64RegisterSet,
+    MemoryWatchpointResponse, ModuleEventKind, QueryMemoryPolicy, ReadMemoryResponse,
+    RegisterContextResponse, StepDirection, StepKind, StepResult, ThreadEventKind, TraceException,
+    TraceModule, TraceModuleEvent, TraceThread, TraceThreadEvent, VectorRegister128,
+    VectorRegister256, X64RegisterSet,
 };
 use super::{Position, ResolvedSymbolConfig};
 use anyhow::{bail, Context};
@@ -278,10 +278,17 @@ type NewCursorFn = unsafe extern "C" fn(*mut TtdMcpTrace, *mut *mut TtdMcpCursor
 type FreeCursorFn = unsafe extern "C" fn(*mut TtdMcpCursor);
 type CursorPositionFn = unsafe extern "C" fn(*mut TtdMcpCursor, *mut TtdMcpPosition) -> i32;
 type SetPositionFn = unsafe extern "C" fn(*mut TtdMcpCursor, TtdMcpPosition) -> i32;
+type SetPositionOnThreadFn = unsafe extern "C" fn(*mut TtdMcpCursor, u32, TtdMcpPosition) -> i32;
 type ReadMemoryFn =
-    unsafe extern "C" fn(*mut TtdMcpCursor, u64, *mut u8, u32, *mut TtdMcpMemoryRead) -> i32;
-type QueryMemoryRangeFn =
-    unsafe extern "C" fn(*mut TtdMcpCursor, u64, *mut u8, u32, *mut TtdMcpMemoryRangeInfo) -> i32;
+    unsafe extern "C" fn(*mut TtdMcpCursor, u64, *mut u8, u32, u32, *mut TtdMcpMemoryRead) -> i32;
+type QueryMemoryRangeFn = unsafe extern "C" fn(
+    *mut TtdMcpCursor,
+    u64,
+    *mut u8,
+    u32,
+    u32,
+    *mut TtdMcpMemoryRangeInfo,
+) -> i32;
 type QueryMemoryBufferWithRangesFn = unsafe extern "C" fn(
     *mut TtdMcpCursor,
     u64,
@@ -289,12 +296,15 @@ type QueryMemoryBufferWithRangesFn = unsafe extern "C" fn(
     u32,
     *mut TtdMcpMemoryBufferRangeInfo,
     u32,
+    u32,
     *mut TtdMcpMemoryBufferInfo,
 ) -> i32;
 type CursorStateFn = unsafe extern "C" fn(*mut TtdMcpCursor, *mut TtdMcpCursorState) -> i32;
 type X64ContextFn = unsafe extern "C" fn(*mut TtdMcpCursor, u32, *mut TtdMcpX64Context) -> i32;
 type ActiveThreadsFn =
     unsafe extern "C" fn(*mut TtdMcpCursor, *mut TtdMcpActiveThreadInfo, u32, *mut u32) -> i32;
+type CursorModulesFn =
+    unsafe extern "C" fn(*mut TtdMcpCursor, *mut TtdMcpModuleInfo, u32, *mut u32) -> i32;
 type StepCursorFn =
     unsafe extern "C" fn(*mut TtdMcpCursor, u32, u32, u8, *mut TtdMcpStepResult) -> i32;
 type MemoryWatchpointFn = unsafe extern "C" fn(
@@ -603,12 +613,27 @@ impl NativeCursor {
         self.bridge.ensure_ok(status, "setting cursor position")
     }
 
+    pub fn set_position_on_thread(
+        &self,
+        thread_unique_id: u32,
+        position: Position,
+    ) -> anyhow::Result<()> {
+        let set_position_on_thread: Symbol<SetPositionOnThreadFn> =
+            unsafe { self.bridge.symbol(b"ttd_mcp_set_position_on_thread\0")? };
+        let status = unsafe {
+            set_position_on_thread(self.handle.as_ptr(), thread_unique_id, position.into())
+        };
+        self.bridge
+            .ensure_ok(status, "setting cursor position on thread")
+    }
+
     pub fn read_memory(
         &self,
         session_id: u64,
         cursor_id: u64,
         address: u64,
         size: u32,
+        policy: QueryMemoryPolicy,
     ) -> anyhow::Result<ReadMemoryResponse> {
         let read_memory: Symbol<ReadMemoryFn> =
             unsafe { self.bridge.symbol(b"ttd_mcp_read_memory\0")? };
@@ -620,6 +645,7 @@ impl NativeCursor {
                 address,
                 buffer.as_mut_ptr(),
                 size,
+                query_memory_policy_code(policy),
                 &mut result,
             )
         };
@@ -635,6 +661,7 @@ impl NativeCursor {
             requested_size: size,
             bytes_read,
             complete: result.complete != 0,
+            policy,
             encoding: "hex".to_string(),
             data: bytes_to_hex(&buffer),
         })
@@ -646,6 +673,7 @@ impl NativeCursor {
         cursor_id: u64,
         address: u64,
         max_bytes: u32,
+        policy: QueryMemoryPolicy,
     ) -> anyhow::Result<MemoryRangeResponse> {
         let query_memory_range: Symbol<QueryMemoryRangeFn> =
             unsafe { self.bridge.symbol(b"ttd_mcp_query_memory_range\0")? };
@@ -657,6 +685,7 @@ impl NativeCursor {
                 address,
                 buffer.as_mut_ptr(),
                 max_bytes,
+                query_memory_policy_code(policy),
                 &mut result,
             )
         };
@@ -674,6 +703,7 @@ impl NativeCursor {
             bytes_available: result.bytes_available,
             bytes_returned,
             complete: result.complete != 0,
+            policy,
             encoding: "hex".to_string(),
             data: bytes_to_hex(&buffer),
             module: None,
@@ -687,6 +717,7 @@ impl NativeCursor {
         address: u64,
         size: u32,
         max_ranges: u32,
+        policy: QueryMemoryPolicy,
     ) -> anyhow::Result<MemoryBufferResponse> {
         let query_memory_buffer_with_ranges: Symbol<QueryMemoryBufferWithRangesFn> = unsafe {
             self.bridge
@@ -703,6 +734,7 @@ impl NativeCursor {
                 size,
                 ranges.as_mut_ptr(),
                 max_ranges,
+                query_memory_policy_code(policy),
                 &mut result,
             )
         };
@@ -721,6 +753,7 @@ impl NativeCursor {
             bytes_read,
             complete: result.complete != 0,
             ranges_truncated: result.ranges_truncated != 0,
+            policy,
             encoding: "hex".to_string(),
             data: bytes_to_hex(&buffer),
             ranges: ranges.into_iter().map(MemoryBufferRange::from).collect(),
@@ -812,6 +845,29 @@ impl NativeCursor {
         self.bridge.ensure_ok(status, "listing active threads")?;
         threads.truncate(count as usize);
         Ok(threads.into_iter().map(ActiveThreadState::from).collect())
+    }
+
+    pub fn cursor_modules(&self) -> anyhow::Result<Vec<TraceModule>> {
+        let cursor_modules: Symbol<CursorModulesFn> =
+            unsafe { self.bridge.symbol(b"ttd_mcp_cursor_modules\0")? };
+        let mut count = 0;
+        let status =
+            unsafe { cursor_modules(self.handle.as_ptr(), std::ptr::null_mut(), 0, &mut count) };
+        self.bridge
+            .ensure_ok(status, "querying cursor module count")?;
+
+        let mut modules = vec![TtdMcpModuleInfo::default(); count as usize];
+        let status = unsafe {
+            cursor_modules(
+                self.handle.as_ptr(),
+                modules.as_mut_ptr(),
+                count,
+                &mut count,
+            )
+        };
+        self.bridge.ensure_ok(status, "listing cursor modules")?;
+        modules.truncate(count as usize);
+        Ok(modules.into_iter().map(TraceModule::from).collect())
     }
 
     pub fn step(
@@ -1305,6 +1361,16 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 
 fn valid_position(position: TtdMcpPosition) -> Option<TtdMcpPosition> {
     (position.sequence != u64::MAX).then_some(position)
+}
+
+fn query_memory_policy_code(policy: QueryMemoryPolicy) -> u32 {
+    match policy {
+        QueryMemoryPolicy::Default => 0,
+        QueryMemoryPolicy::ThreadLocal => 1,
+        QueryMemoryPolicy::GloballyConservative => 2,
+        QueryMemoryPolicy::GloballyAggressive => 3,
+        QueryMemoryPolicy::InFragmentAggressive => 4,
+    }
 }
 
 fn native_memory_access_mask(access: MemoryAccessMask) -> u32 {

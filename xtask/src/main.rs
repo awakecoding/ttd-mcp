@@ -222,6 +222,7 @@ fn mcp_smoke() -> anyhow::Result<()> {
         tool_names.contains(&"ttd_load_trace")
             && tool_names.contains(&"ttd_capabilities")
             && tool_names.contains(&"ttd_list_keyframes")
+            && tool_names.contains(&"ttd_cursor_modules")
             && tool_names.contains(&"ttd_module_events")
             && tool_names.contains(&"ttd_thread_events")
             && tool_names.contains(&"ttd_module_info")

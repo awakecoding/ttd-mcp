@@ -123,6 +123,7 @@ impl SessionRegistry {
                 close_trace: true,
                 list_threads: native,
                 list_modules: native,
+                cursor_modules: native,
                 list_keyframes: native,
                 module_events: native,
                 thread_events: native,
@@ -133,6 +134,7 @@ impl SessionRegistry {
                 cursor_create: true,
                 position_get: true,
                 position_set: true,
+                position_set_thread: native,
                 step: native,
                 compact_registers: native,
                 full_registers: native,
@@ -141,6 +143,7 @@ impl SessionRegistry {
                 stack_read: native,
                 command_line,
                 read_memory: native,
+                memory_query_policy: native,
                 memory_range: native,
                 memory_buffer_ranges: native,
                 memory_watchpoint: native,
@@ -178,6 +181,25 @@ impl SessionRegistry {
             modules: Vec::new(),
         }
         .with_symbol_hint(session.symbols.symbol_path.clone()))
+    }
+
+    pub fn cursor_modules(
+        &self,
+        session_id: SessionId,
+        cursor_id: CursorId,
+    ) -> anyhow::Result<CursorModuleList> {
+        let position = self.cursor_position(session_id, cursor_id)?.position;
+        let cursor = self.cursor(session_id, cursor_id)?;
+        let Some(native) = cursor.native.as_ref() else {
+            bail!("ttd_cursor_modules requires a native TTD replay cursor")
+        };
+
+        Ok(CursorModuleList {
+            session_id,
+            cursor_id,
+            position,
+            modules: native.cursor_modules()?,
+        })
     }
 
     pub fn list_keyframes(&self, session_id: SessionId) -> anyhow::Result<KeyframeList> {
@@ -258,7 +280,14 @@ impl SessionRegistry {
         let registers = self.registers(request.session_id, request.cursor_id)?;
         let session = self.session(request.session_id)?;
         let peb_address = session.info.peb_address;
-        let modules = self.list_modules(request.session_id)?.modules;
+        let modules = self
+            .cursor_modules(request.session_id, request.cursor_id)
+            .map(|modules| modules.modules)
+            .unwrap_or_else(|_| {
+                self.list_modules(request.session_id)
+                    .map(|modules| modules.modules)
+                    .unwrap_or_default()
+            });
         let module = modules
             .iter()
             .find(|module| address_in_module(address, module))
@@ -300,7 +329,7 @@ impl SessionRegistry {
             bail!("ttd_active_threads requires a native TTD replay cursor")
         };
 
-        let modules = self.list_modules(session_id)?.modules;
+        let modules = self.cursor_modules(session_id, cursor_id)?.modules;
         let mut threads = native.active_threads()?;
         for thread in &mut threads {
             thread.module = modules
@@ -376,14 +405,28 @@ impl SessionRegistry {
             .cursors
             .get_mut(&request.cursor_id)
             .ok_or_else(|| anyhow::anyhow!("unknown cursor id: {}", request.cursor_id))?;
-        if let Some(native) = cursor.native.as_ref() {
+        let actual_position = if let Some(thread_unique_id) = request.thread_unique_id {
+            ensure!(thread_unique_id != 0, "thread_unique_id must be non-zero");
+            ensure!(
+                thread_unique_id <= u32::MAX as u64,
+                "thread_unique_id is outside the native TTD range"
+            );
+            let Some(native) = cursor.native.as_ref() else {
+                bail!("thread_unique_id requires a native TTD replay cursor")
+            };
+            native.set_position_on_thread(thread_unique_id as u32, position)?;
+            native.position()?
+        } else if let Some(native) = cursor.native.as_ref() {
             native.set_position(position)?;
-        }
-        cursor.position = position;
+            native.position()?
+        } else {
+            position
+        };
+        cursor.position = actual_position;
         Ok(CursorPosition {
             session_id: request.session_id,
             cursor_id: request.cursor_id,
-            position,
+            position: actual_position,
         })
     }
 
@@ -428,7 +471,9 @@ impl SessionRegistry {
             bail!("ttd_register_context requires a native TTD replay cursor")
         };
 
-        let modules = self.list_modules(request.session_id)?.modules;
+        let modules = self
+            .cursor_modules(request.session_id, request.cursor_id)?
+            .modules;
         let mut context =
             native.x64_context(request.session_id, request.cursor_id, request.thread_id)?;
         context.module = modules
@@ -491,6 +536,7 @@ impl SessionRegistry {
             cursor_id: request.cursor_id,
             address,
             size: request.size,
+            policy: None,
         })?;
         let pointers = if request.decode_pointers {
             let bytes = hex_to_bytes(&memory.data)?;
@@ -609,11 +655,13 @@ impl SessionRegistry {
             bail!("ttd_read_memory requires a native TTD replay cursor")
         };
 
+        let policy = request.policy.unwrap_or_default();
         native.read_memory(
             request.session_id,
             request.cursor_id,
             request.address,
             request.size,
+            policy,
         )
     }
 
@@ -628,13 +676,17 @@ impl SessionRegistry {
             bail!("ttd_memory_range requires a native TTD replay cursor")
         };
 
+        let policy = request.policy.unwrap_or_default();
         let mut range = native.memory_range(
             request.session_id,
             request.cursor_id,
             request.address,
             request.max_bytes,
+            policy,
         )?;
-        let modules = self.list_modules(request.session_id)?.modules;
+        let modules = self
+            .cursor_modules(request.session_id, request.cursor_id)?
+            .modules;
         range.module = modules
             .iter()
             .find(|module| address_in_module(range.range_address, module))
@@ -665,14 +717,18 @@ impl SessionRegistry {
             bail!("ttd_memory_buffer requires a native TTD replay cursor")
         };
 
+        let policy = request.policy.unwrap_or_default();
         let mut response = native.memory_buffer_with_ranges(
             request.session_id,
             request.cursor_id,
             request.address,
             request.size,
             request.max_ranges,
+            policy,
         )?;
-        let modules = self.list_modules(request.session_id)?.modules;
+        let modules = self
+            .cursor_modules(request.session_id, request.cursor_id)?
+            .modules;
         for range in &mut response.ranges {
             range.module = modules
                 .iter()
@@ -752,7 +808,13 @@ fn read_exact_memory(
     let Some(native) = cursor.native.as_ref() else {
         bail!("{label} read requires a native TTD replay cursor")
     };
-    let response = native.read_memory(session_id, cursor_id, address, size)?;
+    let response = native.read_memory(
+        session_id,
+        cursor_id,
+        address,
+        size,
+        QueryMemoryPolicy::Default,
+    )?;
     ensure!(
         response.address == address,
         "{label} read started at {:#x}, expected {:#x}",
