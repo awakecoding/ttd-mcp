@@ -70,6 +70,21 @@ void copy_wide(wchar_t* destination, size_t capacity, wchar_t const* source, siz
     destination[copied] = L'\0';
 }
 
+void copy_wide_z(wchar_t* destination, size_t capacity, wchar_t const* source) noexcept {
+    copy_wide(destination, capacity, source, source == nullptr ? 0 : std::wcslen(source));
+}
+
+TtdMcpGuid to_bridge_guid(GUID const& guid) noexcept {
+    TtdMcpGuid output{
+        guid.Data1,
+        guid.Data2,
+        guid.Data3,
+        {},
+    };
+    std::copy(std::begin(guid.Data4), std::end(guid.Data4), std::begin(output.data4));
+    return output;
+}
+
 TtdMcpStatus validate_list_request(void const* trace, void const* buffer, uint32_t capacity, uint32_t* count) noexcept {
     if (trace == nullptr || count == nullptr) {
         set_error("trace and count pointers are required");
@@ -121,6 +136,57 @@ TtdMcpModuleInfo to_bridge_module(TTD::Replay::Module const* module) noexcept {
     return output;
 }
 
+TtdMcpTraceListEntry to_bridge_trace_list_entry(TTD::Replay::TraceInfo const& trace_info) noexcept {
+    TtdMcpTraceListEntry output = {};
+    output.session_id = to_bridge_guid(trace_info.SessionId);
+    output.group_id = to_bridge_guid(trace_info.GroupId);
+    output.recording_type = static_cast<uint32_t>(trace_info.RecordingType);
+    output.file_info.file_type = static_cast<uint32_t>(trace_info.FileInfo.FileType);
+    output.file_info.trace_index = trace_info.FileInfo.TraceIndex;
+    copy_wide_z(output.file_info.file_name, std::size(output.file_info.file_name), trace_info.FileInfo.pFileName);
+    copy_wide_z(output.file_info.companion_file_name, std::size(output.file_info.companion_file_name), trace_info.FileInfo.pCompanionFileName);
+    return output;
+}
+
+TtdMcpIndexTreeStats to_bridge_index_tree_stats(TTD::Replay::IndexTreeStats const& stats) noexcept {
+    return TtdMcpIndexTreeStats{
+        stats.m_pageSize,
+        stats.m_pageCount,
+        stats.m_innerPageCount,
+        stats.m_innerPageEntryCount,
+        stats.m_innerPageEntryCapacity,
+        stats.m_innerPageEntrySize,
+        stats.m_leafPageCount,
+        stats.m_leafPageEntryCount,
+        stats.m_leafPageEntryCapacity,
+        stats.m_leafPageEntrySize,
+        stats.m_maximumLeafDepth,
+        stats.m_sumOfLeafDepths,
+    };
+}
+
+TtdMcpIndexFileStats to_bridge_index_file_stats(TTD::Replay::IndexFileStats const& stats) noexcept {
+    return TtdMcpIndexFileStats{
+        to_bridge_index_tree_stats(stats.m_globalMemoryIndexStats),
+        to_bridge_index_tree_stats(stats.m_segmentMemoryIndexStats),
+        stats.m_mapPageCallCount,
+        stats.m_lockPageCallCount,
+    };
+}
+
+void __stdcall index_build_progress_callback(
+    void const* caller_context,
+    TTD::Replay::IndexBuildProgressType const* progress_data) noexcept {
+    auto* progress = const_cast<TtdMcpIndexBuildProgress*>(
+        static_cast<TtdMcpIndexBuildProgress const*>(caller_context));
+    if (progress == nullptr || progress_data == nullptr) {
+        return;
+    }
+
+    progress->keyframe_count = progress_data->KeyframeCount;
+    progress->keyframes_processed = progress_data->KeyframesProcessed;
+}
+
 TtdMcpVector128 to_bridge_vector(M128BIT const& value) noexcept {
     return TtdMcpVector128{
         value.Low,
@@ -133,22 +199,13 @@ bool to_data_access_mask(uint32_t value, TTD::Replay::DataAccessMask* access_mas
         return false;
     }
 
-    switch (value) {
-    case 0:
-        *access_mask = TTD::Replay::DataAccessMask::Read;
-        return true;
-    case 1:
-        *access_mask = TTD::Replay::DataAccessMask::Write;
-        return true;
-    case 2:
-        *access_mask = TTD::Replay::DataAccessMask::Execute;
-        return true;
-    case 3:
-        *access_mask = TTD::Replay::DataAccessMask::ReadWrite;
-        return true;
-    default:
+    constexpr uint32_t allowed_mask = static_cast<uint32_t>(TTD::Replay::DataAccessMask::All);
+    if (value == 0 || (value & ~allowed_mask) != 0) {
         return false;
     }
+
+    *access_mask = static_cast<TTD::Replay::DataAccessMask>(value);
+    return true;
 }
 
 bool to_query_memory_policy(uint32_t value, TTD::Replay::QueryMemoryPolicy* policy) noexcept {
@@ -233,8 +290,144 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_open_trace(const wchar_t* trace_path, const 
     return TTD_MCP_OK;
 }
 
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_open_trace_at_index(const wchar_t* trace_path, const wchar_t* companion_path, uint32_t trace_index, const TtdMcpSymbolConfig* symbols, TtdMcpTrace** trace) {
+    if (trace_path == nullptr || trace == nullptr) {
+        set_error("trace_path and trace output pointer are required");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    auto [trace_list, list_result] = TTD::Replay::MakeTraceList();
+    if (list_result != 0 || trace_list == nullptr) {
+        set_error("failed to create TTD trace list");
+        return TTD_MCP_ERROR;
+    }
+
+    static BridgeErrorReporting error_reporting;
+    trace_list->RegisterDebugModeAndLogging(TTD::Replay::DebugModeType::None, &error_reporting);
+
+    wchar_t const* const companion = companion_path != nullptr && companion_path[0] != L'\0'
+        ? companion_path
+        : nullptr;
+    if (!trace_list->LoadFile(trace_path, companion)) {
+        set_error("failed to load trace file into TTD trace list");
+        return TTD_MCP_ERROR;
+    }
+
+    size_t const trace_count = trace_list->GetTraceCount();
+    if (trace_index >= trace_count) {
+        set_error("trace_index is outside the loaded trace list");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    TTD::Replay::UniqueReplayEngine engine(trace_list->OpenTrace(trace_index));
+    if (engine == nullptr) {
+        set_error("failed to open trace from TTD trace list");
+        return TTD_MCP_ERROR;
+    }
+
+    engine->RegisterDebugModeAndLogging(TTD::Replay::DebugModeType::None, &error_reporting);
+    auto* owned = new TtdMcpTrace{
+        std::move(engine),
+        symbols != nullptr && symbols->symbol_path != nullptr ? symbols->symbol_path : L"",
+        symbols != nullptr && symbols->image_path != nullptr ? symbols->image_path : L"",
+        symbols != nullptr && symbols->symbol_cache_dir != nullptr ? symbols->symbol_cache_dir : L"",
+        symbols != nullptr && symbols->symbol_runtime_dir != nullptr ? symbols->symbol_runtime_dir : L"",
+        {}
+    };
+    *trace = owned;
+    return TTD_MCP_OK;
+}
+
 TTD_MCP_EXPORT void ttd_mcp_close_trace(TtdMcpTrace* trace) {
     delete trace;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_traces(const wchar_t* trace_path, const wchar_t* companion_path, TtdMcpTraceListEntry* entries, uint32_t capacity, uint32_t* count) {
+    if (trace_path == nullptr || count == nullptr) {
+        set_error("trace_path and count output pointer are required");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    if (capacity > 0 && entries == nullptr) {
+        set_error("entries output buffer is required when capacity is non-zero");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    auto [trace_list, list_result] = TTD::Replay::MakeTraceList();
+    if (list_result != 0 || trace_list == nullptr) {
+        set_error("failed to create TTD trace list");
+        return TTD_MCP_ERROR;
+    }
+
+    static BridgeErrorReporting error_reporting;
+    trace_list->RegisterDebugModeAndLogging(TTD::Replay::DebugModeType::None, &error_reporting);
+
+    wchar_t const* const companion = companion_path != nullptr && companion_path[0] != L'\0'
+        ? companion_path
+        : nullptr;
+    if (!trace_list->LoadFile(trace_path, companion)) {
+        set_error("failed to load trace file into TTD trace list");
+        return TTD_MCP_ERROR;
+    }
+
+    size_t const required = trace_list->GetTraceCount();
+    TtdMcpStatus const count_status = set_required_count(required, count);
+    if (count_status != TTD_MCP_OK) {
+        return count_status;
+    }
+
+    if (capacity < required) {
+        return TTD_MCP_OK;
+    }
+
+    for (size_t index = 0; index < required; ++index) {
+        entries[index] = to_bridge_trace_list_entry(trace_list->GetTraceInfo(index));
+    }
+
+    return TTD_MCP_OK;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_index_status(TtdMcpTrace* trace, uint32_t* status) {
+    if (trace == nullptr || status == nullptr) {
+        set_error("trace and status pointers are required");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    *status = static_cast<uint32_t>(trace->engine->GetIndexStatus());
+    return TTD_MCP_OK;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_index_file_stats(TtdMcpTrace* trace, TtdMcpIndexFileStats* stats) {
+    if (trace == nullptr || stats == nullptr) {
+        set_error("trace and stats pointers are required");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    *stats = to_bridge_index_file_stats(trace->engine->GetIndexFileStats());
+    return TTD_MCP_OK;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_build_index(TtdMcpTrace* trace, uint32_t flags, TtdMcpIndexBuildProgress* progress, uint32_t* status) {
+    if (trace == nullptr || progress == nullptr || status == nullptr) {
+        set_error("trace, progress, and status pointers are required");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    constexpr uint32_t allowed_flags =
+        static_cast<uint32_t>(TTD::Replay::IndexBuildFlags::DeleteExistingUnloadableIndexFile)
+        | static_cast<uint32_t>(TTD::Replay::IndexBuildFlags::TemporaryIndexFile)
+        | static_cast<uint32_t>(TTD::Replay::IndexBuildFlags::MakeSelfContained);
+    if ((flags & ~allowed_flags) != 0) {
+        set_error("unsupported index build flags");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    *progress = {};
+    *status = static_cast<uint32_t>(trace->engine->BuildIndex(
+        index_build_progress_callback,
+        progress,
+        static_cast<TTD::Replay::IndexBuildFlags>(flags)));
+    return TTD_MCP_OK;
 }
 
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_trace_info(TtdMcpTrace* trace, TtdMcpTraceInfo* info) {
@@ -897,7 +1090,7 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_step_cursor(TtdMcpCursor* cursor, uint32_t d
     return TTD_MCP_OK;
 }
 
-TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_memory_watchpoint(TtdMcpCursor* cursor, uint64_t address, uint32_t size, uint32_t access_mask, uint32_t direction, TtdMcpMemoryWatchpointResult* result) {
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_memory_watchpoint(TtdMcpCursor* cursor, uint64_t address, uint32_t size, uint32_t access_mask, uint32_t direction, uint64_t thread_unique_id, TtdMcpMemoryWatchpointResult* result) {
     if (cursor == nullptr || result == nullptr) {
         set_error("cursor and result pointers are required");
         return TTD_MCP_INVALID_ARGUMENT;
@@ -920,15 +1113,20 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_memory_watchpoint(TtdMcpCursor* cursor, uint
 
     TTD::Replay::DataAccessMask native_access_mask = TTD::Replay::DataAccessMask::None;
     if (!to_data_access_mask(access_mask, &native_access_mask)) {
-        set_error("access_mask must be 0 for read, 1 for write, 2 for execute, or 3 for read_write");
+        set_error("access_mask must be a non-zero TTD DataAccessMask bitset");
         return TTD_MCP_INVALID_ARGUMENT;
     }
+
+    TTD::Replay::UniqueThreadId const native_thread =
+        thread_unique_id == 0
+            ? TTD::Replay::UniqueThreadId::Invalid
+            : static_cast<TTD::Replay::UniqueThreadId>(thread_unique_id);
 
     TTD::Replay::MemoryWatchpointData const watchpoint{
         static_cast<TTD::GuestAddress>(address),
         static_cast<uint64_t>(size),
         native_access_mask,
-        TTD::Replay::UniqueThreadId::Invalid,
+        native_thread,
     };
 
     std::scoped_lock lock(cursor->trace->mutex);
@@ -972,7 +1170,32 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_open_trace(const wchar_t*, const TtdMcpSymbo
     return TTD_MCP_NOT_IMPLEMENTED;
 }
 
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_open_trace_at_index(const wchar_t*, const wchar_t*, uint32_t, const TtdMcpSymbolConfig*, TtdMcpTrace**) {
+    set_error("TTD replay bridge is not implemented in this build");
+    return TTD_MCP_NOT_IMPLEMENTED;
+}
+
 TTD_MCP_EXPORT void ttd_mcp_close_trace(TtdMcpTrace*) {}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_traces(const wchar_t*, const wchar_t*, TtdMcpTraceListEntry*, uint32_t, uint32_t*) {
+    set_error("TTD replay bridge is not implemented in this build");
+    return TTD_MCP_NOT_IMPLEMENTED;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_index_status(TtdMcpTrace*, uint32_t*) {
+    set_error("TTD replay bridge is not implemented in this build");
+    return TTD_MCP_NOT_IMPLEMENTED;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_index_file_stats(TtdMcpTrace*, TtdMcpIndexFileStats*) {
+    set_error("TTD replay bridge is not implemented in this build");
+    return TTD_MCP_NOT_IMPLEMENTED;
+}
+
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_build_index(TtdMcpTrace*, uint32_t, TtdMcpIndexBuildProgress*, uint32_t*) {
+    set_error("TTD replay bridge is not implemented in this build");
+    return TTD_MCP_NOT_IMPLEMENTED;
+}
 
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_trace_info(TtdMcpTrace*, TtdMcpTraceInfo*) {
     set_error("TTD replay bridge is not implemented in this build");
@@ -1071,7 +1294,7 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_step_cursor(TtdMcpCursor*, uint32_t, uint32_
     return TTD_MCP_NOT_IMPLEMENTED;
 }
 
-TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_memory_watchpoint(TtdMcpCursor*, uint64_t, uint32_t, uint32_t, uint32_t, TtdMcpMemoryWatchpointResult*) {
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_memory_watchpoint(TtdMcpCursor*, uint64_t, uint32_t, uint32_t, uint32_t, uint64_t, TtdMcpMemoryWatchpointResult*) {
     set_error("TTD replay bridge is not implemented in this build");
     return TTD_MCP_NOT_IMPLEMENTED;
 }

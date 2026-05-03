@@ -40,6 +40,54 @@ typedef struct TtdMcpSymbolConfig {
     const wchar_t* symbol_runtime_dir;
 } TtdMcpSymbolConfig;
 
+typedef struct TtdMcpGuid {
+    uint32_t data1;
+    uint16_t data2;
+    uint16_t data3;
+    uint8_t data4[8];
+} TtdMcpGuid;
+
+typedef struct TtdMcpTraceFileInfo {
+    uint32_t file_type;
+    wchar_t file_name[1024];
+    wchar_t companion_file_name[1024];
+    uint32_t trace_index;
+} TtdMcpTraceFileInfo;
+
+typedef struct TtdMcpTraceListEntry {
+    TtdMcpGuid session_id;
+    TtdMcpGuid group_id;
+    uint32_t recording_type;
+    TtdMcpTraceFileInfo file_info;
+} TtdMcpTraceListEntry;
+
+typedef struct TtdMcpIndexBuildProgress {
+    uint32_t keyframe_count;
+    uint32_t keyframes_processed;
+} TtdMcpIndexBuildProgress;
+
+typedef struct TtdMcpIndexTreeStats {
+    uint64_t page_size;
+    uint64_t page_count;
+    uint64_t inner_page_count;
+    uint64_t inner_page_entry_count;
+    uint64_t inner_page_entry_capacity;
+    uint64_t inner_page_entry_size;
+    uint64_t leaf_page_count;
+    uint64_t leaf_page_entry_count;
+    uint64_t leaf_page_entry_capacity;
+    uint64_t leaf_page_entry_size;
+    uint64_t maximum_leaf_depth;
+    uint64_t sum_of_leaf_depths;
+} TtdMcpIndexTreeStats;
+
+typedef struct TtdMcpIndexFileStats {
+    TtdMcpIndexTreeStats global_memory;
+    TtdMcpIndexTreeStats segment_memory;
+    uint64_t map_page_call_count;
+    uint64_t lock_page_call_count;
+} TtdMcpIndexFileStats;
+
 typedef struct TtdMcpThreadInfo {
     uint64_t unique_id;
     uint32_t thread_id;
@@ -221,7 +269,12 @@ typedef enum TtdMcpStatus {
 } TtdMcpStatus;
 
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_open_trace(const wchar_t* trace_path, const TtdMcpSymbolConfig* symbols, TtdMcpTrace** trace);
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_open_trace_at_index(const wchar_t* trace_path, const wchar_t* companion_path, uint32_t trace_index, const TtdMcpSymbolConfig* symbols, TtdMcpTrace** trace);
 TTD_MCP_EXPORT void ttd_mcp_close_trace(TtdMcpTrace* trace);
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_traces(const wchar_t* trace_path, const wchar_t* companion_path, TtdMcpTraceListEntry* entries, uint32_t capacity, uint32_t* count);
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_index_status(TtdMcpTrace* trace, uint32_t* status);
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_index_file_stats(TtdMcpTrace* trace, TtdMcpIndexFileStats* stats);
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_build_index(TtdMcpTrace* trace, uint32_t flags, TtdMcpIndexBuildProgress* progress, uint32_t* status);
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_trace_info(TtdMcpTrace* trace, TtdMcpTraceInfo* info);
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_threads(TtdMcpTrace* trace, TtdMcpThreadInfo* threads, uint32_t capacity, uint32_t* count);
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_modules(TtdMcpTrace* trace, TtdMcpModuleInfo* modules, uint32_t capacity, uint32_t* count);
@@ -242,7 +295,7 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_x64_context(TtdMcpCursor* cursor, uint32_t t
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_active_threads(TtdMcpCursor* cursor, TtdMcpActiveThreadInfo* threads, uint32_t capacity, uint32_t* count);
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_cursor_modules(TtdMcpCursor* cursor, TtdMcpModuleInfo* modules, uint32_t capacity, uint32_t* count);
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_step_cursor(TtdMcpCursor* cursor, uint32_t direction, uint32_t count, uint8_t only_current_thread, TtdMcpStepResult* result);
-TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_memory_watchpoint(TtdMcpCursor* cursor, uint64_t address, uint32_t size, uint32_t access_mask, uint32_t direction, TtdMcpMemoryWatchpointResult* result);
+TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_memory_watchpoint(TtdMcpCursor* cursor, uint64_t address, uint32_t size, uint32_t access_mask, uint32_t direction, uint64_t thread_unique_id, TtdMcpMemoryWatchpointResult* result);
 TTD_MCP_EXPORT const char* ttd_mcp_last_error(void);
 
 #ifdef __cplusplus

@@ -1,8 +1,8 @@
 # Architecture
 
-`ttd-mcp` is a Windows-first MCP server for offline WinDbg Time Travel Debugging traces.
+`windbg-tool` is a Windows-first WinDbg automation workspace. Its single executable hosts the `windbg-ttd` MCP server/daemon/client commands, plus broader WinDbg helpers such as DbgEng process-server launch and WinDbg package install/update/launch.
 
-The server is split into three layers:
+The TTD replay surface is split into three layers:
 
 1. Rust MCP server over stdio using the official `rmcp` Rust MCP SDK. This owns MCP protocol transport, tool schemas, session ids, validation, symbol-path settings, and packaging workflow.
 2. Safe Rust replay facade. This keeps TTD positions, sessions, cursors, memory reads, modules, threads, and exceptions in serializable Rust types.
@@ -17,7 +17,7 @@ Build-time SDK inputs come from NuGet:
 - `Microsoft.TimeTravelDebugging.Apis` for headers and import libraries.
 - `Microsoft.Debugging.Platform.SymSrv` for Microsoft symbol-server compatible downloads.
 - `Microsoft.Debugging.Platform.SrcSrv` for source-server support alongside public symbols.
-- `Microsoft.Debugging.Platform.DbgEng` for debugger-platform headers and DLLs when needed later.
+- `Microsoft.Debugging.Platform.DbgEng` for DbgEng process-server headers, import libraries, and redistributable runtime DLLs.
 
 Runtime replay requires `TTDReplay.dll` and `TTDReplayCPU.dll`. Microsoft samples acquire these from the WinDbg/TTD MSIX distribution rather than a separate public NuGet package. Use:
 
@@ -37,7 +37,7 @@ The default symbol path is equivalent to:
 srv*.ttd-symbol-cache*https://msdl.microsoft.com/download/symbols
 ```
 
-`cargo xtask deps` stages `dbghelp.dll`, `symsrv.dll`, and `srcsrv.dll` from Microsoft Debugging Platform NuGet packages into `target/symbol-runtime`. Keep this repo-local and process-local; do not set machine-wide `_NT_SYMBOL_PATH` or write debugger registry keys as part of normal server operation. If `_NT_SYMBOL_PATH` is already set in the server process environment, use it as a fallback only when the MCP request does not provide explicit `symbols.symbol_paths`.
+`cargo xtask deps` stages `dbghelp.dll`, `symsrv.dll`, and `srcsrv.dll` from Microsoft Debugging Platform NuGet packages into `target/symbol-runtime`, and stages DbgEng process-server runtime DLLs into `target/dbgeng-runtime`. Keep this repo-local and process-local; do not set machine-wide `_NT_SYMBOL_PATH` or write debugger registry keys as part of normal server operation. If `_NT_SYMBOL_PATH` is already set in the server process environment, use it as a fallback only when the MCP request does not provide explicit `symbols.symbol_paths`.
 
 Callers can provide additional binary paths, symbol paths, and a symbol cache directory when loading a trace. Public symbols are useful for module/function names. Private symbols are needed for richer function signatures and local details.
 

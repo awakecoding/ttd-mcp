@@ -5,7 +5,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use ttd_mcp::ttd_replay::SymbolSettings;
+use windbg_ttd::ttd_replay::SymbolSettings;
 
 pub const EXPECT_NATIVE_ENV: &str = "TTD_MCP_EXPECT_NATIVE_REPLAY";
 const PING_TRACE_ARCHIVE: &str = "traces/ping.7z";
@@ -119,7 +119,7 @@ pub fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
-        .expect("crate lives under <workspace>/crates/ttd-mcp")
+        .expect("crate lives under <workspace>/crates/<name>")
         .to_path_buf()
 }
 

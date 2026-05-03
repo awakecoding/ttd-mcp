@@ -7,6 +7,10 @@ use std::path::PathBuf;
 pub struct LoadTraceRequest {
     pub trace_path: PathBuf,
     #[serde(default)]
+    pub companion_path: Option<PathBuf>,
+    #[serde(default)]
+    pub trace_index: Option<u32>,
+    #[serde(default)]
     pub symbols: SymbolSettings,
 }
 
@@ -23,6 +27,10 @@ pub struct TraceInfo {
     pub trace_path: PathBuf,
     pub backend: String,
     pub index_status: String,
+    pub trace_file: Option<TraceFileInfo>,
+    pub trace_session_id: Option<String>,
+    pub trace_group_id: Option<String>,
+    pub recording_type: Option<String>,
     pub process_id: Option<u32>,
     pub peb_address: Option<u64>,
     pub lifetime_start: Position,
@@ -34,6 +42,103 @@ pub struct TraceInfo {
     pub exception_count: usize,
     pub keyframe_count: Option<usize>,
     pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TraceListRequest {
+    pub trace_path: PathBuf,
+    #[serde(default)]
+    pub companion_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceListResponse {
+    pub trace_path: PathBuf,
+    pub companion_path: Option<PathBuf>,
+    pub trace_count: usize,
+    pub traces: Vec<TraceListEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceListEntry {
+    pub index: u32,
+    pub session_id: String,
+    pub group_id: String,
+    pub recording_type: String,
+    pub file: TraceFileInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceFileInfo {
+    pub file_type: String,
+    pub file_name: Option<PathBuf>,
+    pub companion_file_name: Option<PathBuf>,
+    pub trace_index: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct IndexStatusRequest {
+    pub session_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexStatusResponse {
+    pub session_id: u64,
+    pub status: String,
+    pub raw_status: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct IndexStatsRequest {
+    pub session_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexStatsResponse {
+    pub session_id: u64,
+    pub global_memory: IndexTreeStats,
+    pub segment_memory: IndexTreeStats,
+    pub map_page_call_count: u64,
+    pub lock_page_call_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexTreeStats {
+    pub page_size: u64,
+    pub page_count: u64,
+    pub inner_page_count: u64,
+    pub inner_page_entry_count: u64,
+    pub inner_page_entry_capacity: u64,
+    pub inner_page_entry_size: u64,
+    pub leaf_page_count: u64,
+    pub leaf_page_entry_count: u64,
+    pub leaf_page_entry_capacity: u64,
+    pub leaf_page_entry_size: u64,
+    pub maximum_leaf_depth: u64,
+    pub sum_of_leaf_depths: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct IndexBuildRequest {
+    pub session_id: u64,
+    #[serde(default)]
+    pub flags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexBuildResponse {
+    pub session_id: u64,
+    pub status: String,
+    pub raw_status: u32,
+    pub flags: Vec<String>,
+    pub raw_flags: u32,
+    pub progress: IndexBuildProgress,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexBuildProgress {
+    pub keyframe_count: u32,
+    pub keyframes_processed: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +154,10 @@ pub struct CapabilitiesResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayCapabilities {
     pub trace_info: bool,
+    pub trace_list: bool,
+    pub index_status: bool,
+    pub index_stats: bool,
+    pub build_index: bool,
     pub close_trace: bool,
     pub list_threads: bool,
     pub list_modules: bool,
@@ -608,6 +717,8 @@ pub struct MemoryWatchpointRequest {
     pub size: u32,
     pub access: MemoryAccessMask,
     pub direction: MemoryAccessDirection,
+    #[serde(default)]
+    pub thread_unique_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -617,6 +728,7 @@ pub struct MemoryWatchpointResponse {
     pub requested_address: u64,
     pub requested_size: u32,
     pub requested_access: MemoryAccessMask,
+    pub requested_thread_unique_id: Option<u64>,
     pub direction: MemoryAccessDirection,
     pub found: bool,
     pub position: Position,
@@ -636,7 +748,13 @@ pub enum MemoryAccessMask {
     Read,
     Write,
     Execute,
+    CodeFetch,
+    Overwrite,
+    DataMismatch,
+    NewData,
+    RedundantData,
     ReadWrite,
+    All,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
