@@ -53,7 +53,7 @@ Symbol support is configured per trace session. The default symbol path is:
 srv*.ttd-symbol-cache*https://msdl.microsoft.com/download/symbols
 ```
 
-The server stages DbgHelp/SymSrv/SrcSrv from Microsoft Debugging Platform NuGet packages into `target/symbol-runtime`. It does not set machine-wide `_NT_SYMBOL_PATH` or write debugger registry keys; callers pass binary paths, symbol paths, and cache settings through `ttd_load_trace`.
+The server stages DbgHelp/SymSrv/SrcSrv from Microsoft Debugging Platform NuGet packages into `target/symbol-runtime`. It does not set machine-wide `_NT_SYMBOL_PATH` or write debugger registry keys; callers pass binary paths, symbol paths, and cache settings through `ttd_load_trace`. If `symbols.symbol_paths` is empty and `_NT_SYMBOL_PATH` is set in the server process environment, the server uses `_NT_SYMBOL_PATH` as the starting symbol path.
 
 `ttd_load_trace` returns both the legacy `symbol_path` string and a `symbols` object with the resolved symbol path, image path, cache directory, symbol runtime directory, and binary path count. The native bridge ABI accepts the same resolved fields so the replay backend can initialize symbol support without relying on machine-wide debugger settings.
 
@@ -113,7 +113,7 @@ The optional `symbols` object accepted by `ttd_load_trace` has these fields:
 }
 ```
 
-If `symbol_paths` does not already include the Microsoft public symbol server, the server appends `srv*<symcache_dir>*https://msdl.microsoft.com/download/symbols` automatically. `binary_paths` are joined into the native image path so replay and later symbol features can find binaries that match the trace.
+If `symbol_paths` is empty, `_NT_SYMBOL_PATH` is used when set. If the resulting symbol path does not already include the Microsoft public symbol server, the server appends `srv*<symcache_dir>*https://msdl.microsoft.com/download/symbols` automatically. `binary_paths` are joined into the native image path so replay and later symbol features can find binaries that match the trace.
 
 ### Trace Metadata Tools
 

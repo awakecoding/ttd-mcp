@@ -37,7 +37,7 @@ The default symbol path is equivalent to:
 srv*.ttd-symbol-cache*https://msdl.microsoft.com/download/symbols
 ```
 
-`cargo xtask deps` stages `dbghelp.dll`, `symsrv.dll`, and `srcsrv.dll` from Microsoft Debugging Platform NuGet packages into `target/symbol-runtime`. Keep this repo-local and process-local; do not set machine-wide `_NT_SYMBOL_PATH` or write debugger registry keys as part of normal server operation.
+`cargo xtask deps` stages `dbghelp.dll`, `symsrv.dll`, and `srcsrv.dll` from Microsoft Debugging Platform NuGet packages into `target/symbol-runtime`. Keep this repo-local and process-local; do not set machine-wide `_NT_SYMBOL_PATH` or write debugger registry keys as part of normal server operation. If `_NT_SYMBOL_PATH` is already set in the server process environment, use it as a fallback only when the MCP request does not provide explicit `symbols.symbol_paths`.
 
 Callers can provide additional binary paths, symbol paths, and a symbol cache directory when loading a trace. Public symbols are useful for module/function names. Private symbols are needed for richer function signatures and local details.
 

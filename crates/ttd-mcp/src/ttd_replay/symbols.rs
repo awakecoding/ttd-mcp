@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{env, path::PathBuf};
 
 pub const MICROSOFT_SYMBOL_SERVER: &str = "https://msdl.microsoft.com/download/symbols";
+const NT_SYMBOL_PATH_ENV: &str = "_NT_SYMBOL_PATH";
 const DEFAULT_SYMBOL_CACHE: &str = ".ttd-symbol-cache";
 const DEFAULT_SYMBOL_RUNTIME_DIR: &str = "target/symbol-runtime";
 
@@ -35,7 +36,19 @@ impl SymbolSettings {
     }
 
     pub fn resolve(&self, symbol_runtime_dir: Option<PathBuf>) -> ResolvedSymbolConfig {
-        let mut paths = self.symbol_paths.clone();
+        self.resolve_with_symbol_path_env(symbol_runtime_dir, env_symbol_path())
+    }
+
+    fn resolve_with_symbol_path_env(
+        &self,
+        symbol_runtime_dir: Option<PathBuf>,
+        env_symbol_path: Option<String>,
+    ) -> ResolvedSymbolConfig {
+        let mut paths = if self.symbol_paths.is_empty() {
+            env_symbol_path.map(|path| vec![path]).unwrap_or_default()
+        } else {
+            self.symbol_paths.clone()
+        };
         let microsoft_public_symbols = paths
             .iter()
             .any(|path| path.contains(MICROSOFT_SYMBOL_SERVER));
@@ -85,6 +98,13 @@ pub fn default_symbol_runtime_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_SYMBOL_RUNTIME_DIR))
 }
 
+fn env_symbol_path() -> Option<String> {
+    env::var_os(NT_SYMBOL_PATH_ENV).and_then(|value| {
+        let value = value.to_string_lossy().trim().to_string();
+        (!value.is_empty()).then_some(value)
+    })
+}
+
 impl ResolvedSymbolConfig {
     pub fn has_image_path(&self) -> bool {
         !self.image_path.is_empty()
@@ -99,7 +119,8 @@ mod tests {
     fn builds_default_symbol_path() {
         let settings = SymbolSettings::default();
         assert!(settings
-            .effective_symbol_path()
+            .resolve_with_symbol_path_env(None, None)
+            .symbol_path
             .contains(MICROSOFT_SYMBOL_SERVER));
     }
 
@@ -110,7 +131,7 @@ mod tests {
             ..SymbolSettings::default()
         };
 
-        let resolved = settings.resolve(None);
+        let resolved = settings.resolve_with_symbol_path_env(None, None);
         assert_eq!(
             resolved.symbol_cache_dir,
             PathBuf::from("target/test-symbol-cache")
@@ -127,7 +148,7 @@ mod tests {
             ..SymbolSettings::default()
         };
 
-        let resolved = settings.resolve(None);
+        let resolved = settings.resolve_with_symbol_path_env(None, None);
         assert_eq!(
             resolved
                 .symbol_path
@@ -135,6 +156,38 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn uses_nt_symbol_path_when_symbol_paths_are_empty() {
+        let resolved = SymbolSettings::default().resolve_with_symbol_path_env(
+            None,
+            Some("srv*C:/env-symbols*https://example.invalid/symbols".to_string()),
+        );
+        assert!(resolved
+            .symbol_path
+            .contains("srv*C:/env-symbols*https://example.invalid/symbols"));
+        assert!(resolved.symbol_path.contains(MICROSOFT_SYMBOL_SERVER));
+    }
+
+    #[test]
+    fn explicit_symbol_paths_override_nt_symbol_path() {
+        let settings = SymbolSettings {
+            symbol_paths: vec![
+                "srv*C:/explicit-symbols*https://example.invalid/explicit".to_string()
+            ],
+            ..SymbolSettings::default()
+        };
+
+        let resolved = settings.resolve_with_symbol_path_env(
+            None,
+            Some("srv*C:/env-symbols*https://example.invalid/symbols".to_string()),
+        );
+
+        assert!(resolved
+            .symbol_path
+            .contains("srv*C:/explicit-symbols*https://example.invalid/explicit"));
+        assert!(!resolved.symbol_path.contains("C:/env-symbols"));
     }
 
     #[test]
@@ -147,7 +200,8 @@ mod tests {
             ..SymbolSettings::default()
         };
 
-        let resolved = settings.resolve(Some(PathBuf::from("target/symbol-runtime")));
+        let resolved = settings
+            .resolve_with_symbol_path_env(Some(PathBuf::from("target/symbol-runtime")), None);
         assert_eq!(resolved.binary_path_count, 2);
         assert_eq!(
             resolved.symbol_runtime_dir,
