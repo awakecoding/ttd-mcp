@@ -49,6 +49,48 @@ fn cli_reuses_trace_session_through_named_pipe_daemon() -> anyhow::Result<()> {
             .any(|session| session["session_id"] == session_id)),
         "sessions command should show the opened session: {sessions}"
     );
+    let context = run_json(
+        &ttd,
+        &pipe,
+        [
+            "context".to_string(),
+            "snapshot".to_string(),
+            "--session".to_string(),
+            session_id.to_string(),
+            "--cursor".to_string(),
+            cursor_id.to_string(),
+        ],
+    )?;
+    ensure!(
+        context["selected"]["session_id"].as_u64() == Some(session_id)
+            && context["selected"]["cursor_id"].as_u64() == Some(cursor_id),
+        "context snapshot should preserve the selected session/cursor: {context}"
+    );
+    ensure!(
+        context["trace_info"]["ok"].as_bool() == Some(true)
+            && context["capabilities"]["ok"].as_bool() == Some(true),
+        "context snapshot should include session-level diagnostics: {context}"
+    );
+    ensure!(
+        context["timeline_summary"].is_object(),
+        "context snapshot should include a bounded timeline summary: {context}"
+    );
+    let symbol_diagnostics = run_json(
+        &ttd,
+        &pipe,
+        [
+            "symbols".to_string(),
+            "diagnose".to_string(),
+            "--session".to_string(),
+            session_id.to_string(),
+        ],
+    )?;
+    ensure!(
+        symbol_diagnostics["checks"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|check| check["id"] == "symbol-path")),
+        "symbols diagnose should include symbol-path checks: {symbol_diagnostics}"
+    );
 
     let position = run_json(
         &ttd,
@@ -100,6 +142,78 @@ fn local_discovery_is_complete_without_daemon() -> anyhow::Result<()> {
     let ttd = ttd_bin();
     let tools = run_local_json(&ttd, ["tools".to_string()])?;
     let discover = run_local_json(&ttd, ["discover".to_string()])?;
+    let recipes = run_local_json(&ttd, ["recipes".to_string()])?;
+    let remote_recipe = run_local_json(
+        &ttd,
+        ["recipes".to_string(), "remote-debugging".to_string()],
+    )?;
+    let remote_explain = run_local_json(&ttd, ["remote".to_string(), "explain".to_string()])?;
+    let remote_connect = run_local_json(
+        &ttd,
+        [
+            "remote".to_string(),
+            "connect-command".to_string(),
+            "--kind".to_string(),
+            "dbgsrv".to_string(),
+            "--server".to_string(),
+            "target01".to_string(),
+        ],
+    )?;
+    let live_capabilities = run_local_json(&ttd, ["live".to_string(), "capabilities".to_string()])?;
+    let breakpoint_capabilities =
+        run_local_json(&ttd, ["breakpoint".to_string(), "capabilities".to_string()])?;
+    let datamodel_capabilities =
+        run_local_json(&ttd, ["datamodel".to_string(), "capabilities".to_string()])?;
+    let target_capabilities =
+        run_local_json(&ttd, ["target".to_string(), "capabilities".to_string()])?;
+    let symbol_inspect = run_local_json(
+        &ttd,
+        [
+            "symbols".to_string(),
+            "inspect".to_string(),
+            path_string(&ttd),
+        ],
+    )?;
+    let symbol_exports = run_local_json(
+        &ttd,
+        [
+            "symbols".to_string(),
+            "exports".to_string(),
+            path_string(&ttd),
+        ],
+    )?;
+    let source_root =
+        std::env::temp_dir().join(format!("windbg-tool-source-resolve-{}", std::process::id()));
+    let source_file = source_root.join("src").join("debug").join("sample.cpp");
+    std::fs::create_dir_all(
+        source_file
+            .parent()
+            .context("source file should have parent")?,
+    )?;
+    std::fs::write(&source_file, b"int main() { return 0; }\n")?;
+    let source_resolve = run_local_json(
+        &ttd,
+        [
+            "source".to_string(),
+            "resolve".to_string(),
+            r"C:\agent\work\src\debug\sample.cpp".to_string(),
+            "--search-path".to_string(),
+            path_string(&source_root),
+        ],
+    )?;
+    let _ = std::fs::remove_dir_all(&source_root);
+    let search_order = run_local_json(
+        &ttd,
+        [
+            "module".to_string(),
+            "search-order".to_string(),
+            "missing-test-dll".to_string(),
+            "--app-dir".to_string(),
+            path_string(&std::env::temp_dir()),
+            "--max-path-dirs".to_string(),
+            "2".to_string(),
+        ],
+    )?;
     let schema = run_local_json(&ttd, ["schema".to_string(), "ttd_read_memory".to_string()])?;
     ensure!(
         schema["name"] == "ttd_read_memory",
@@ -132,8 +246,120 @@ fn local_discovery_is_complete_without_daemon() -> anyhow::Result<()> {
         .collect::<std::collections::HashSet<_>>();
     ensure!(
         discover["command_groups"]["dbgeng"].is_array()
-            && discover["command_groups"]["windbg"].is_array(),
+            && discover["command_groups"]["windbg"].is_array()
+            && discover["command_groups"]["context"].is_array()
+            && discover["command_groups"]["remote"].is_array()
+            && discover["command_groups"]["live"].is_array()
+            && discover["command_groups"]["breakpoint"].is_array()
+            && discover["command_groups"]["datamodel"].is_array()
+            && discover["command_groups"]["target"].is_array()
+            && discover["command_groups"]["symbols"].is_array()
+            && discover["command_groups"]["source"].is_array()
+            && discover["command_metadata"]
+                .as_array()
+                .is_some_and(|items| items
+                    .iter()
+                    .any(|item| item["command"] == "sweep watch-memory"
+                        && item["cost"] == "bounded_high_replay"))
+            && discover["command_groups"]["disassembly"].is_array()
+            && discover["command_groups"]["object"].is_array(),
         "discover manifest should advertise broader WinDbg command groups: {discover}"
+    );
+    let recipe_items = discover["recipes"]
+        .as_array()
+        .context("discover should include recipes")?;
+    for recipe_id in [
+        "diagnostic-technique",
+        "remote-debugging",
+        "stack-corruption",
+        "symbol-health",
+        "memory-provenance",
+    ] {
+        ensure!(
+            recipe_items.iter().any(|recipe| recipe["id"] == recipe_id),
+            "discover manifest should include recipe {recipe_id}: {discover}"
+        );
+    }
+    ensure!(
+        recipes["recipes"]
+            .as_array()
+            .is_some_and(|items| items.len() >= recipe_items.len()),
+        "recipes command should list the manifest recipes: {recipes}"
+    );
+    ensure!(
+        remote_recipe["recipes"]
+            .as_array()
+            .is_some_and(|items| items.len() == 1 && items[0]["id"] == "remote-debugging"),
+        "recipes <id> should filter to the requested recipe: {remote_recipe}"
+    );
+    ensure!(
+        remote_explain["workflows"]
+            .as_array()
+            .is_some_and(
+                |items| items.iter().any(|workflow| workflow["kind"] == "dbgsrv")
+                    && items.iter().any(|workflow| workflow["kind"] == "ntsd")
+            ),
+        "remote explain should compare DbgSrv and NTSD/CDB workflows: {remote_explain}"
+    );
+    ensure!(
+        remote_connect["command"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|arg| arg == "-premote")
+                && items
+                    .iter()
+                    .any(|arg| arg.as_str() == Some("tcp:port=5005,server=target01"))),
+        "remote connect-command should generate a WinDbg -premote command: {remote_connect}"
+    );
+    ensure!(
+        live_capabilities["implemented"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item == "live launch --command-line <cmd> --end detach|terminate")),
+        "live capabilities should advertise the one-shot live launch primitive: {live_capabilities}"
+    );
+    ensure!(
+        breakpoint_capabilities["implemented"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item == "sweep watch-memory")),
+        "breakpoint capabilities should mention sweep watch-memory: {breakpoint_capabilities}"
+    );
+    ensure!(
+        datamodel_capabilities["gaps"]
+            .as_array()
+            .is_some_and(|items| items
+                .iter()
+                .any(|item| item == "DbgEng dx expression evaluation")),
+        "datamodel capabilities should identify dx as a gap: {datamodel_capabilities}"
+    );
+    ensure!(
+        target_capabilities["target_kinds"]
+            .as_array()
+            .is_some_and(|items| items
+                .iter()
+                .any(|item| item["kind"] == "ttd_trace" && item["status"] == "implemented")),
+        "target capabilities should distinguish supported target kinds: {target_capabilities}"
+    );
+    ensure!(
+        symbol_inspect["image_symbol_store_key"].is_string(),
+        "symbols inspect should report image symbol-store keys: {symbol_inspect}"
+    );
+    ensure!(
+        symbol_exports["total_exports"].is_u64() && symbol_exports["exports"].is_array(),
+        "symbols exports should report a structured export list, even when empty: {symbol_exports}"
+    );
+    ensure!(
+        source_resolve["best"]["path"].is_string()
+            && source_resolve["best"]["matched_components"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 3,
+        "source resolve should find the local file by trailing components: {source_resolve}"
+    );
+    ensure!(
+        search_order["dll"] == "missing-test-dll.dll"
+            && search_order["candidates"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty()),
+        "module search-order should normalize names and return candidates: {search_order}"
     );
     for tool in tools["tools"]
         .as_array()
@@ -298,6 +524,30 @@ fn ping_trace_agent_cli_scenario_uses_long_lived_daemon_session() -> anyhow::Res
             "50".to_string(),
         ],
     )?;
+    run_json_vec(
+        &ttd,
+        &pipe,
+        vec![
+            "replay".to_string(),
+            "capabilities".to_string(),
+            "--session".to_string(),
+            session_id.to_string(),
+        ],
+    )?;
+    run_json_vec(
+        &ttd,
+        &pipe,
+        vec![
+            "replay".to_string(),
+            "to".to_string(),
+            "--session".to_string(),
+            session_id.to_string(),
+            "--cursor".to_string(),
+            cursor_id.to_string(),
+            "--position".to_string(),
+            "50".to_string(),
+        ],
+    )?;
     let sequence = run_stdout(
         &ttd,
         &pipe,
@@ -350,6 +600,14 @@ fn ping_trace_agent_cli_scenario_uses_long_lived_daemon_session() -> anyhow::Res
             "threads".to_string(),
             "--session".to_string(),
             session_id.to_string(),
+        ],
+        vec![
+            "timeline".to_string(),
+            "events".to_string(),
+            "--session".to_string(),
+            session_id.to_string(),
+            "--max-events".to_string(),
+            "32".to_string(),
         ],
     ] {
         run_json_vec(&ttd, &pipe, args)?;
@@ -572,6 +830,63 @@ fn assert_native_ping_cli_aliases(
                 .is_some_and(|name| name.eq_ignore_ascii_case("ping.exe")))),
         "native ping module list should include ping.exe: {modules}"
     );
+    run_json_vec(
+        ttd,
+        pipe,
+        vec![
+            "module".to_string(),
+            "audit".to_string(),
+            "--session".to_string(),
+            session_id.to_string(),
+            "--cursor".to_string(),
+            cursor_id.to_string(),
+        ],
+    )?;
+    let context = run_json_vec(
+        ttd,
+        pipe,
+        vec![
+            "context".to_string(),
+            "snapshot".to_string(),
+            "--session".to_string(),
+            session_id.to_string(),
+            "--cursor".to_string(),
+            cursor_id.to_string(),
+        ],
+    )?;
+    ensure!(
+        context["architecture_state"]["ok"].as_bool() == Some(true)
+            && context["current_disassembly"]["ok"].as_bool() == Some(true)
+            && context["timeline_summary"]["ok"].as_bool() == Some(true),
+        "native context snapshot should include architecture, disassembly, and timeline data: {context}"
+    );
+    let registers = run_json_vec(
+        ttd,
+        pipe,
+        vec![
+            "registers".to_string(),
+            "--session".to_string(),
+            session_id.to_string(),
+            "--cursor".to_string(),
+            cursor_id.to_string(),
+        ],
+    )?;
+    if let Some(program_counter) = registers["program_counter"].as_u64() {
+        run_json_vec(
+            ttd,
+            pipe,
+            vec![
+                "symbols".to_string(),
+                "nearest".to_string(),
+                "--session".to_string(),
+                session_id.to_string(),
+                "--cursor".to_string(),
+                cursor_id.to_string(),
+                "--address".to_string(),
+                program_counter.to_string(),
+            ],
+        )?;
+    }
 
     for args in [
         vec![
@@ -598,18 +913,30 @@ fn assert_native_ping_cli_aliases(
             cursor_id.to_string(),
         ],
         vec![
-            "registers".to_string(),
+            "register-context".to_string(),
             "--session".to_string(),
             session_id.to_string(),
             "--cursor".to_string(),
             cursor_id.to_string(),
         ],
         vec![
-            "register-context".to_string(),
+            "architecture".to_string(),
+            "state".to_string(),
             "--session".to_string(),
             session_id.to_string(),
             "--cursor".to_string(),
             cursor_id.to_string(),
+        ],
+        vec![
+            "disasm".to_string(),
+            "--session".to_string(),
+            session_id.to_string(),
+            "--cursor".to_string(),
+            cursor_id.to_string(),
+            "--count".to_string(),
+            "4".to_string(),
+            "--bytes".to_string(),
+            "32".to_string(),
         ],
         vec![
             "stack".to_string(),
@@ -628,6 +955,30 @@ fn assert_native_ping_cli_aliases(
             cursor_id.to_string(),
             "--size".to_string(),
             "64".to_string(),
+        ],
+        vec![
+            "stack".to_string(),
+            "recover".to_string(),
+            "--session".to_string(),
+            session_id.to_string(),
+            "--cursor".to_string(),
+            cursor_id.to_string(),
+            "--size".to_string(),
+            "256".to_string(),
+            "--max-candidates".to_string(),
+            "8".to_string(),
+        ],
+        vec![
+            "stack".to_string(),
+            "backtrace".to_string(),
+            "--session".to_string(),
+            session_id.to_string(),
+            "--cursor".to_string(),
+            cursor_id.to_string(),
+            "--size".to_string(),
+            "256".to_string(),
+            "--max-frames".to_string(),
+            "8".to_string(),
         ],
         vec![
             "step".to_string(),
@@ -710,11 +1061,49 @@ fn assert_native_ping_cli_aliases(
                 "--cursor".to_string(),
                 cursor_id.to_string(),
                 "--address".to_string(),
-                peb,
+                peb.clone(),
                 "--size".to_string(),
                 "16".to_string(),
                 "--max-ranges".to_string(),
                 "8".to_string(),
+            ],
+            vec![
+                "memory".to_string(),
+                "strings".to_string(),
+                "--session".to_string(),
+                session_id.to_string(),
+                "--cursor".to_string(),
+                cursor_id.to_string(),
+                "--address".to_string(),
+                peb.clone(),
+                "--size".to_string(),
+                "64".to_string(),
+                "--max-strings".to_string(),
+                "8".to_string(),
+            ],
+            vec![
+                "memory".to_string(),
+                "dps".to_string(),
+                "--session".to_string(),
+                session_id.to_string(),
+                "--cursor".to_string(),
+                cursor_id.to_string(),
+                "--address".to_string(),
+                peb.clone(),
+                "--size".to_string(),
+                "32".to_string(),
+            ],
+            vec![
+                "memory".to_string(),
+                "chase".to_string(),
+                "--session".to_string(),
+                session_id.to_string(),
+                "--cursor".to_string(),
+                cursor_id.to_string(),
+                "--address".to_string(),
+                peb,
+                "--depth".to_string(),
+                "1".to_string(),
             ],
         ] {
             run_json_vec(ttd, pipe, args)?;

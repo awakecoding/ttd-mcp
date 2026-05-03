@@ -30,7 +30,7 @@ Do not bind Rust directly to TTD C++ vtables, STL helper types, or C++ ownership
 
 ## Current Implementation State
 
-The Rust MCP server uses `rmcp` for stdio MCP protocol handling, advertises tools, and can use the native bridge for trace pack/list enumeration, trace loading with trace-index selection, trace index status/stats/build operations, trace metadata, thread/module/exception/keyframe enumeration, cursor-local module snapshots, module and thread lifecycle event timelines, cursor creation, position get/set including TTD thread-scoped seeking, active-thread snapshots, stepping/tracing, compact and x64 scalar/SIMD cursor register/thread state, bounded guest memory reads with selectable TTD query policies, trace-backed memory range and buffer provenance queries, memory watchpoint replay with full TTD access masks and optional thread filters, and PEB-backed command-line extraction when `ttd_replay_bridge.dll` and TTD runtime DLLs are available.
+The Rust MCP server uses `rmcp` for stdio MCP protocol handling, advertises tools, and can use the native bridge for trace pack/list enumeration, trace loading with trace-index selection, trace index status/stats/build operations, trace metadata, thread/module/exception/keyframe enumeration, cursor-local module snapshots, module and thread lifecycle event timelines, cursor creation, position get/set including TTD thread-scoped seeking, active-thread snapshots, stepping/tracing, compact and x64 scalar/SIMD cursor register/thread state, bounded guest memory reads with selectable TTD query policies, trace-backed memory range and buffer provenance queries, memory watchpoint replay with full TTD access masks and optional thread filters, and PEB-backed command-line extraction when `ttd_replay_bridge.dll` and TTD runtime DLLs are available. The CLI also has daemon-free `recipes` discovery for TimDbg-inspired diagnostic workflows, `context snapshot` for one-shot agent context capture with architecture/disassembly/nearest-symbol/timeline enrichment from a running daemon session, `remote` helpers that explain and generate DbgSrv versus NTSD/CDB command lines, `symbols diagnose`/`symbols inspect`/`symbols exports`/`symbols nearest` for symbol/binary/PDB/export readiness checks and nearest-export fallback, `source resolve` for trailing-component source path matching, `disasm`/`u` for x64 instruction analysis, `object vtable` for read-only COM/C++ object analysis, `stack recover` for corrupted-stack return-address candidates, and `memory dump`/`memory classify`/`memory strings`/`memory dps`/`memory chase` for string/fill/entropy/pointer/instruction hints, bounded string extraction, dps-style pointer rows, and bounded pointer-chain inspection.
 
 ## Build And Check Commands
 
@@ -55,6 +55,33 @@ The same executable also supports:
 target/debug/windbg-tool.exe daemon start
 target/debug/windbg-tool.exe daemon ensure
 target/debug/windbg-tool.exe discover
+target/debug/windbg-tool.exe recipes
+target/debug/windbg-tool.exe context snapshot --session <id> --cursor <id>
+target/debug/windbg-tool.exe remote explain
+target/debug/windbg-tool.exe live capabilities
+target/debug/windbg-tool.exe live launch --command-line "C:\Windows\System32\notepad.exe" --end detach
+target/debug/windbg-tool.exe breakpoint capabilities
+target/debug/windbg-tool.exe datamodel capabilities
+target/debug/windbg-tool.exe target capabilities --session <id> --cursor <id>
+target/debug/windbg-tool.exe symbols diagnose --session <id>
+target/debug/windbg-tool.exe symbols inspect <exe-or-dll>
+target/debug/windbg-tool.exe symbols exports <exe-or-dll> --filter <name>
+target/debug/windbg-tool.exe symbols nearest --session <id> --cursor <id> --address <addr>
+target/debug/windbg-tool.exe source resolve <recorded-path> --search-path <source-root>
+target/debug/windbg-tool.exe module audit --session <id>
+target/debug/windbg-tool.exe module search-order suspicious.dll --app-dir <app-dir>
+target/debug/windbg-tool.exe architecture state --session <id> --cursor <id>
+target/debug/windbg-tool.exe replay capabilities --session <id>
+target/debug/windbg-tool.exe replay to --session <id> --cursor <id> --position 50
+target/debug/windbg-tool.exe sweep watch-memory --session <id> --cursor <id> --address <addr> --size 8 --access write --direction previous --max-hits 8
+target/debug/windbg-tool.exe timeline events --session <id>
+target/debug/windbg-tool.exe disasm --session <id> --cursor <id>
+target/debug/windbg-tool.exe object vtable --session <id> --cursor <id> --address <object>
+target/debug/windbg-tool.exe stack recover --session <id> --cursor <id>
+target/debug/windbg-tool.exe stack backtrace --session <id> --cursor <id>
+target/debug/windbg-tool.exe memory strings --session <id> --cursor <id> --address <addr> --size 256 --encoding both
+target/debug/windbg-tool.exe memory dps --session <id> --cursor <id> --address <addr> --size 128 --target-info
+target/debug/windbg-tool.exe memory chase --session <id> --cursor <id> --address <addr> --depth 8
 target/debug/windbg-tool.exe trace-list <trace.ttd>
 target/debug/windbg-tool.exe open <trace.run>
 target/debug/windbg-tool.exe index status --session <id>
@@ -127,8 +154,8 @@ Close the program cleanly so TTD finalizes the `.run` and `.idx` files.
 
 ## Likely Next Implementation Steps
 
-1. Add full architecture-specific register contexts beyond the compact PC/SP/FP/TEB snapshot.
-2. Add process artifact helpers beyond command-line extraction, such as basic stack inspection.
-3. Expand module output with symbol loading details once symbolication is wired beyond raw module paths.
-4. Add optional watchpoint replay limits or thread filters if large traces need narrower searches.
-5. Expand black-box MCP stdio tests alongside new replay-backed tool behavior.
+1. Add symbol/binary/source diagnostics and nearest-symbol helpers.
+2. Add instruction-aware disassembly and memory classification commands.
+3. Add stack unwind/recovery workflows, including TTD stack-corruption watchpoint scenarios.
+4. Improve remote debugging recipes and lifecycle helpers beyond raw DbgSrv launch.
+5. Add live DbgEng session support after the daemon abstractions are ready.

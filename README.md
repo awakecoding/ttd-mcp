@@ -108,26 +108,75 @@ Discovery commands work without a running daemon:
 
 ```powershell
 target/debug/windbg-tool.exe discover
+target/debug/windbg-tool.exe recipes
+target/debug/windbg-tool.exe context snapshot --session 1 --cursor 1
+target/debug/windbg-tool.exe remote explain
+target/debug/windbg-tool.exe symbols diagnose --session 1
+target/debug/windbg-tool.exe symbols inspect C:\Windows\System32\notepad.exe
+target/debug/windbg-tool.exe symbols exports C:\Windows\System32\kernel32.dll --filter CreateFile
+target/debug/windbg-tool.exe symbols nearest --session 1 --cursor 1 --address 0x7ff612341000
+target/debug/windbg-tool.exe source resolve C:\build\repo\src\main.cpp --search-path D:\src\repo
+target/debug/windbg-tool.exe disasm --session 1 --cursor 1 --count 12
+target/debug/windbg-tool.exe memory chase --session 1 --cursor 1 --address 0x12345678 --depth 8
 target/debug/windbg-tool.exe tools
 target/debug/windbg-tool.exe schema ttd_read_memory
 ```
+
+`discover` includes `command_metadata` entries with daemon/native requirements, session/cursor requirements, rough cost, bounds, architecture notes, and safety labels so agent skills can choose cheap read-only commands before expensive replay operations.
 
 Focused commands are thin aliases over the same daemon `tools/call` path used by MCP:
 
 | Area | Commands |
 | --- | --- |
-| Discovery | `discover`, `tools`, `schema <tool>` |
-| Daemon | `daemon ensure`, `daemon start --detach`, `daemon status`, `daemon shutdown`, `sessions` |
+| Discovery | `discover`, `recipes [topic]`, `advise [topic]`, `tools`, `schema <tool>` |
+| Daemon/context | `daemon ensure`, `daemon start --detach`, `daemon status`, `daemon shutdown`, `sessions`, `context snapshot` |
 | DbgEng | `dbgeng server --transport <transport>`, `dbgsrv --transport <transport>` |
+| Remote debugging | `remote explain`, `remote server-command`, `remote connect-command` |
+| Live debugging | `live capabilities`, `live launch --command-line <cmd> --end detach|terminate` |
+| Breakpoints/data model | `breakpoint capabilities`, `datamodel capabilities` |
+| Targets | `target capabilities`, `target capabilities --session <id> --cursor <id>` |
 | WinDbg | `windbg status`, `windbg install`, `windbg update`, `windbg path`, `windbg run -- <args>` |
 | Session | `open`, `load`, `close`, `info`, `capabilities`, `tool <name>` |
+| Symbols/source | `symbols diagnose`, `symbols inspect`, `symbols exports`, `symbols nearest`, `source resolve` |
 | Index | `index status`, `index stats`, `index build --flag <flag>` |
-| Metadata | `trace-list`, `trace list`, `threads`, `modules`, `keyframes`, `exceptions`, `events modules`, `events threads`, `module info` |
-| Cursor/navigation | `cursor create`, `cursor modules`, `position get`, `position set`, `active-threads`, `step` |
-| State | `registers`, `register-context`, `stack info`, `stack read`, `command-line`, `address` |
-| Memory | `memory read`, `memory range`, `memory buffer`, `memory watchpoint`, `watchpoint` |
+| Metadata | `trace-list`, `trace list`, `threads`, `modules`, `keyframes`, `exceptions`, `events modules`, `events threads`, `timeline events`, `module info`, `module audit`, `module search-order` |
+| Cursor/navigation | `cursor create`, `cursor modules`, `position get`, `position set`, `active-threads`, `step`, `replay capabilities`, `replay to`, `replay watch-memory`, `sweep watch-memory` |
+| State | `architecture state`, `arch state`, `registers`, `register-context`, `stack info`, `stack read`, `stack recover`, `stack backtrace`, `command-line`, `address` |
+| Disassembly | `disasm`, `u` |
+| Memory | `memory read`, `memory range`, `memory buffer`, `memory dump`, `memory strings`, `memory dps`, `memory classify`, `memory chase`, `memory watchpoint`, `watchpoint` |
+| Object analysis | `object vtable` |
 
 Most commands accept `-s` as a short form for `--session` and `-c` as a short form for `--cursor`. Common command aliases include `caps`, `mods`, `active`, `regs`, `ctx`, and `cmdline`.
+
+`architecture state` reports the detected cursor architecture, whether x64 register context/disassembly helpers are supported, and explicit x86/ARM64 gaps so agents can avoid retrying architecture-specific commands blindly.
+
+`replay capabilities` reports which replay controls are currently real versus native bridge gaps. `replay to` wraps cursor position seeking with before/after output, and `replay watch-memory` is a semantic alias for memory watchpoint replay.
+
+`sweep watch-memory` repeats TTD memory watchpoint replay with `--max-hits`, advances one step after each hit, and stops on duplicate positions or no further hits. It is a bounded foreground sweep; daemon-owned background jobs with progress/cancel are still a future native/daemon layer.
+
+`timeline events --session <id>` merges exposed module, thread, exception, and keyframe metadata into a single sequence-sorted event stream. It also reports recording-client/custom-event/activity/island metadata as a native bridge gap when those payloads are not available.
+
+`recipes` is a local, daemon-free diagnostic advisor inspired by TimDbg workflows. It explains when to use logs, dumps, TTD, live debugging, remote debugging, symbol diagnostics, memory provenance, stack-corruption watchpoints, COM/vtable inspection, and safe injection analysis. `context snapshot` is the fastest agent entry point after a session is open: it gathers daemon state, sessions, selected trace/cursor details, capabilities, position, active threads, stack, architecture state, current disassembly, nearest-export fallback, timeline summary, and command-line information into one JSON object.
+
+`remote explain` compares DbgSrv process servers with NTSD/CDB `-server` sessions. Use `remote server-command` on the target side and `remote connect-command --server <host>` on the host side to generate copy-pasteable WinDbg command lines without confusing `-remote` and `-premote`.
+
+`live capabilities` reports the current live DbgEng surface and gaps. `live launch --command-line <cmd>` is a one-shot live primitive: it launches a process under DbgEng, waits for the initial debug event, reports execution status, then explicitly detaches or terminates according to `--end`.
+
+`breakpoint capabilities` and `datamodel capabilities` make the remaining live breakpoint manager and DbgEng data-model/TargetModel gaps explicit while pointing agents to the supported TTD watchpoint sweep and structured JSON discovery surfaces.
+
+`target capabilities` distinguishes implemented TTD trace sessions from one-shot live DbgEng, future persisted live sessions, dump sessions, and TargetModel support. Add `--session` and optionally `--cursor` to include selected TTD backend and architecture evidence.
+
+`symbols diagnose --session <id>` reports the current symbol path, image path, Microsoft public-symbol configuration, module-data availability, PE image identity, CodeView PDB identity, export summary, and source-fidelity gaps. Add `--name <module>` or `--address <addr>` to narrow the diagnosis to one module. `symbols inspect <path>` works without a daemon and prints PE timestamp/size/checksum plus expected image and PDB symbol-store keys. `symbols exports <path>` lists PE exports with optional filtering, and `symbols nearest --session <id> --cursor <id> --address <addr>` provides a low-fidelity nearest-export fallback for addresses in loaded modules when private PDB symbols are unavailable. `source resolve` uses trailing path-component matching to map recorded PDB source paths to local checkouts.
+
+`memory dump` wraps `memory read` with structured `db`, `dq`, ASCII, and UTF-16 views. `memory strings` extracts bounded ASCII/UTF-16 strings with `--min-len` and `--max-strings`, while `memory dps` prints pointer-sized rows with optional `--target-info` classification. `memory classify` adds agent-friendly interpretation for ASCII/UTF-16 strings, repeated fill bytes, entropy, qword values, plausible x64 pointers, and instruction-like prefixes. `memory chase` follows a bounded pointer chain from `base + --offset` at each hop, with explicit `--depth`, `--pointer-size`, and optional `--target-info` address classification.
+
+`disasm` uses the current cursor RIP by default, or `--address <addr>` when provided. It returns x64 instruction bytes, formatted Intel/NASM-style text, flow-control classification, memory operand metadata, and tags such as `call`, `return`, `jump`, `memory_access`, `stack_related`, `teb_tls_segment`, and `breakpoint`.
+
+`object vtable` is a read-only helper for COM/C++ object investigations: it reads the first pointer-sized field as a vtable pointer, dumps entries, and classifies each target address through the existing address/module context.
+
+`stack recover` scans stack memory for pointer-sized values that land in loaded modules, ranks them as possible return addresses, and can enrich each candidate through `address` classification with `--target-info`. `stack backtrace` combines the current program counter with recovered return-address candidates into a clearly marked heuristic frame list when a trusted unwind is unavailable.
+
+`module audit` is a read-only inventory helper for injection-like symptoms. It flags missing module paths, locally unavailable binaries, duplicate basenames loaded from different paths, network paths, temp/download paths, and user-writable locations as triage evidence without attempting code injection or process mutation. `module search-order <dll> --app-dir <dir>` models common DLL search-order candidates and highlights risky directories so an agent can reason about hijacking/search-order symptoms without changing registry or process state.
 
 Every MCP tool remains available through the generic escape hatch, which is useful for skills that already have a complete MCP argument object:
 
