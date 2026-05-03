@@ -10,6 +10,13 @@ const DEFAULT_SYMBOL_CACHE: &str = ".ttd-symbol-cache";
 const MICROSOFT_SYMBOL_SERVER: &str = "https://msdl.microsoft.com/download/symbols";
 const NATIVE_BRIDGE_DLL: &str = "ttd_replay_bridge.dll";
 const TTD_RUNTIME_FILES: &[&str] = &["TTDReplay.dll", "TTDReplayCPU.dll"];
+const DBGENG_RUNTIME_FILES: &[&str] = &[
+    "dbgeng.dll",
+    "dbgcore.dll",
+    "dbghelp.dll",
+    "dbgmodel.dll",
+    "msdia140.dll",
+];
 
 struct SymbolRuntimeFile {
     package: &'static str,
@@ -50,7 +57,7 @@ fn main() -> anyhow::Result<()> {
 fn doctor() -> anyhow::Result<()> {
     let root = workspace_root()?;
 
-    println!("ttd-mcp doctor");
+    println!("windbg-tool doctor");
     println!("  OS: {}", env::consts::OS);
     check_command("cargo");
     check_command("nuget");
@@ -74,6 +81,16 @@ fn doctor() -> anyhow::Result<()> {
     );
     for file in SYMBOL_RUNTIME_FILES {
         check_file(&symbol_runtime_dir.join(file.dll));
+    }
+    let dbgeng_runtime_dir = env::var_os("WINDBG_DBGENG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target/dbgeng-runtime"));
+    println!(
+        "  info: checking DbgEng runtime dir {}",
+        dbgeng_runtime_dir.display()
+    );
+    for file in DBGENG_RUNTIME_FILES {
+        check_file(&dbgeng_runtime_dir.join(file));
     }
     println!(
         "  info: default symbol path srv*{}*{}",
@@ -113,6 +130,8 @@ fn deps() -> anyhow::Result<()> {
 
     stage_symbol_runtime(&packages_dir, &root.join("target/symbol-runtime"))
         .context("staging symbol runtime DLLs")?;
+    stage_dbgeng_runtime(&packages_dir, &root.join("target/dbgeng-runtime"))
+        .context("staging DbgEng runtime DLLs")?;
 
     run(Command::new("powershell")
         .arg("-ExecutionPolicy")
@@ -167,8 +186,8 @@ fn package() -> anyhow::Result<()> {
     let package_dir = root.join("target/package");
     fs::create_dir_all(&package_dir).context("creating package directory")?;
     copy_if_exists(
-        &root.join("target/debug/ttd-mcp.exe"),
-        &package_dir.join("ttd-mcp.exe"),
+        &root.join("target/debug/windbg-tool.exe"),
+        &package_dir.join("windbg-tool.exe"),
     )?;
     copy_first_existing(
         native_bridge_candidates(&root),
@@ -185,18 +204,26 @@ fn package() -> anyhow::Result<()> {
             &package_dir.join(file.dll),
         )?;
     }
+    copy_runtime_files(
+        &root.join("target/dbgeng-runtime"),
+        &package_dir,
+        DBGENG_RUNTIME_FILES,
+    )?;
     println!("Package directory prepared at {}", package_dir.display());
     Ok(())
 }
 
 fn mcp_smoke() -> anyhow::Result<()> {
     let root = workspace_root()?;
-    run(Command::new("cargo").arg("build").arg("-p").arg("ttd-mcp"))
-        .context("building ttd-mcp before packaged MCP smoke test")?;
+    run(Command::new("cargo")
+        .arg("build")
+        .arg("-p")
+        .arg("windbg-tool"))
+    .context("building windbg-tool before packaged MCP smoke test")?;
     package().context("preparing MCP package directory")?;
 
     let package_dir = root.join("target/package");
-    let server_path = package_dir.join("ttd-mcp.exe");
+    let server_path = package_dir.join("windbg-tool.exe");
     ensure!(
         server_path.is_file(),
         "packaged server was not found at {}",
@@ -318,6 +345,25 @@ fn stage_symbol_runtime(packages_dir: &Path, symbol_runtime_dir: &Path) -> anyho
         println!("Staged {}", destination.display());
     }
 
+    Ok(())
+}
+
+fn stage_dbgeng_runtime(packages_dir: &Path, dbgeng_runtime_dir: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(dbgeng_runtime_dir).context("creating target/dbgeng-runtime")?;
+    let arch = native_package_arch();
+    for dll in DBGENG_RUNTIME_FILES {
+        let source = package_content_file(
+            packages_dir,
+            "Microsoft.Debugging.Platform.DbgEng",
+            dll,
+            arch,
+        )?;
+        let destination = dbgeng_runtime_dir.join(dll);
+        fs::copy(&source, &destination).with_context(|| {
+            format!("copying {} to {}", source.display(), destination.display())
+        })?;
+        println!("Staged {}", destination.display());
+    }
     Ok(())
 }
 
@@ -478,7 +524,7 @@ impl SmokeClient {
                 "protocolVersion": "2025-11-25",
                 "capabilities": {},
                 "clientInfo": {
-                    "name": "ttd-mcp-package-smoke",
+                    "name": "windbg-tool-package-smoke",
                     "version": "0.0.0"
                 }
             }

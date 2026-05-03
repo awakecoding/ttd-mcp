@@ -4,7 +4,7 @@ use common::{
     ensure_ping_fixture_extracted, ping_symbol_settings, ping_trace_path, workspace_root,
     EXPECT_NATIVE_ENV,
 };
-use ttd_mcp::ttd_replay::{
+use windbg_ttd::ttd_replay::{
     AddressClassification, AddressInfoRequest, LoadTraceRequest, MemoryAccessDirection,
     MemoryAccessMask, MemoryBufferRequest, MemoryRangeRequest, MemoryWatchpointRequest,
     ModuleInfoRequest, Position, PositionOrPercent, PositionRequest, QueryMemoryPolicy,
@@ -51,6 +51,8 @@ fn loads_ping_trace_fixture_and_exercises_cursor_path() -> anyhow::Result<()> {
     let mut registry = SessionRegistry::default();
     let loaded = registry.load_trace(LoadTraceRequest {
         trace_path: trace_path.clone(),
+        companion_path: None,
+        trace_index: None,
         symbols: symbol_settings,
     })?;
     assert_eq!(loaded.symbol_path, resolved_symbols.symbol_path);
@@ -869,6 +871,7 @@ fn assert_native_memory_watchpoint(
         size: 16,
         access: MemoryAccessMask::Read,
         direction: MemoryAccessDirection::Previous,
+        thread_unique_id: None,
     })?;
     let current = registry.cursor_position(session_id, cursor_id)?;
 
@@ -893,7 +896,7 @@ fn assert_native_memory_watchpoint(
         watchpoint
     );
     ensure!(
-        watchpoint.match_access == Some(ttd_mcp::ttd_replay::MemoryAccessKind::Read),
+        watchpoint.match_access == Some(windbg_ttd::ttd_replay::MemoryAccessKind::Read),
         "watchpoint hit should be a read access: {:?}",
         watchpoint
     );
@@ -926,6 +929,7 @@ fn assert_native_memory_watchpoint(
         size: 16,
         access: MemoryAccessMask::Read,
         direction: MemoryAccessDirection::Previous,
+        thread_unique_id: None,
     })?;
     ensure!(
         !no_hit.found,

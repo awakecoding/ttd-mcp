@@ -1,4 +1,5 @@
 use anyhow::{bail, ensure, Context};
+#[path = "..\\..\\windbg-ttd\\tests\\common\\mod.rs"]
 mod common;
 use common::{path_string, ping_binary_paths, ping_trace_path};
 use serde_json::{json, Value};
@@ -11,7 +12,7 @@ fn initialize_ping_and_tools_list_roundtrip_over_stdio() -> anyhow::Result<()> {
     let mut client = McpClient::start()?;
 
     let initialize = client.initialize()?;
-    assert_eq!(initialize["result"]["serverInfo"]["name"], "ttd-mcp");
+    assert_eq!(initialize["result"]["serverInfo"]["name"], "windbg-ttd");
     ensure!(
         initialize["result"]["capabilities"]["tools"].is_object(),
         "initialize result should advertise tools capability: {initialize}"
@@ -51,6 +52,14 @@ fn initialize_ping_and_tools_list_roundtrip_over_stdio() -> anyhow::Result<()> {
         assert_tool_schema(tool)?;
     }
 
+    Ok(())
+}
+
+#[test]
+fn explicit_mcp_subcommand_starts_stdio_server() -> anyhow::Result<()> {
+    let mut client = McpClient::start_with_args(["mcp"])?;
+    let initialize = client.initialize()?;
+    assert_eq!(initialize["result"]["serverInfo"]["name"], "windbg-ttd");
     Ok(())
 }
 
@@ -749,12 +758,21 @@ struct McpClient {
 
 impl McpClient {
     fn start() -> anyhow::Result<Self> {
+        Self::start_with_args(std::iter::empty::<&str>())
+    }
+
+    fn start_with_args<I, S>(args: I) -> anyhow::Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
         let mut child = Command::new(server_binary())
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("spawning ttd-mcp")?;
+            .context("spawning windbg-tool")?;
         let stdin = child.stdin.take().context("child stdin was not piped")?;
         let stdout = child.stdout.take().context("child stdout was not piped")?;
 
@@ -780,7 +798,7 @@ impl McpClient {
                 "protocolVersion": "2025-11-25",
                 "capabilities": {},
                 "clientInfo": {
-                    "name": "ttd-mcp-test",
+                    "name": "windbg-ttd-test",
                     "version": "0.0.0"
                 }
             }
@@ -835,7 +853,7 @@ impl Drop for McpClient {
 }
 
 fn server_binary() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_ttd-mcp")
+    option_env!("CARGO_BIN_EXE_windbg-tool")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             let mut path = std::env::current_exe().expect("current test executable path");
@@ -843,7 +861,7 @@ fn server_binary() -> PathBuf {
             if path.ends_with("deps") {
                 path.pop();
             }
-            path.push(format!("ttd-mcp{}", std::env::consts::EXE_SUFFIX));
+            path.push(format!("windbg-tool{}", std::env::consts::EXE_SUFFIX));
             path
         })
 }
@@ -867,9 +885,13 @@ fn ping_load_trace_args(trace_path: &Path) -> Value {
 fn expected_tool_names() -> &'static [&'static str] {
     &[
         "ttd_load_trace",
+        "ttd_trace_list",
         "ttd_close_trace",
         "ttd_trace_info",
         "ttd_capabilities",
+        "ttd_index_status",
+        "ttd_index_stats",
+        "ttd_build_index",
         "ttd_list_threads",
         "ttd_list_modules",
         "ttd_cursor_modules",
@@ -930,10 +952,13 @@ fn assert_tool_schema(tool: &Value) -> anyhow::Result<()> {
 
 fn required_args_for_tool(name: &str) -> anyhow::Result<&'static [&'static str]> {
     match name {
-        "ttd_load_trace" => Ok(&["trace_path"]),
+        "ttd_load_trace" | "ttd_trace_list" => Ok(&["trace_path"]),
         "ttd_close_trace"
         | "ttd_trace_info"
         | "ttd_capabilities"
+        | "ttd_index_status"
+        | "ttd_index_stats"
+        | "ttd_build_index"
         | "ttd_list_threads"
         | "ttd_list_modules"
         | "ttd_list_keyframes"

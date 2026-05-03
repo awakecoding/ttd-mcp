@@ -1,5 +1,5 @@
+use crate::service::ReplayService;
 use crate::tools::{self, ToolCall};
-use crate::ttd_replay::SessionRegistry;
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
@@ -9,12 +9,10 @@ use rmcp::{
     ErrorData as McpError, ServerHandler,
 };
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 #[derive(Clone, Default)]
 pub struct TtdMcpServer {
-    sessions: Arc<Mutex<SessionRegistry>>,
+    service: ReplayService,
 }
 
 impl ServerHandler for TtdMcpServer {
@@ -23,14 +21,14 @@ impl ServerHandler for TtdMcpServer {
             protocol_version: Default::default(),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation {
-                name: "ttd-mcp".to_string(),
+                name: "windbg-ttd".to_string(),
                 title: None,
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 description: None,
                 icons: None,
                 website_url: None,
             },
-            instructions: Some("Offline WinDbg Time Travel Debugging trace inspection. Load .run/.ttd traces, create cursors, seek positions, inspect metadata, and query replay state.".to_string()),
+            instructions: Some("Offline WinDbg Time Travel Debugging trace inspection. Load .run/.idx/.ttd traces, create cursors, seek positions, inspect metadata, and query replay state.".to_string()),
         }
     }
 
@@ -61,8 +59,7 @@ impl ServerHandler for TtdMcpServer {
             name: request.name.into_owned(),
             arguments: request.arguments.map(Value::Object).unwrap_or(Value::Null),
         };
-        let mut sessions = self.sessions.lock().await;
-        let result = tools::call(&mut sessions, call).await;
+        let result = self.service.call_tool(call).await;
 
         match result {
             Ok(value) => Ok(tool_text(value)),

@@ -1,17 +1,18 @@
 use crate::ttd_replay::{
-    AddressInfoRequest, CursorId, LoadTraceRequest, MemoryAccessDirection, MemoryBufferRequest,
-    MemoryRangeRequest, MemoryWatchpointRequest, ModuleInfoRequest, Position, PositionRequest,
-    ReadMemoryRequest, RegisterContextRequest, SessionId, SessionRegistry, StackReadRequest,
-    StepRequest,
+    AddressInfoRequest, CursorId, IndexBuildRequest, IndexStatsRequest, IndexStatusRequest,
+    LoadTraceRequest, MemoryAccessDirection, MemoryBufferRequest, MemoryRangeRequest,
+    MemoryWatchpointRequest, ModuleInfoRequest, Position, PositionRequest, ReadMemoryRequest,
+    RegisterContextRequest, SessionId, SessionRegistry, StackReadRequest, StepRequest,
+    TraceListRequest,
 };
 use anyhow::{bail, Context};
 use rmcp::model::{JsonObject, Tool};
 use schemars::{schema_for, JsonSchema};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ToolCall {
     pub name: String,
     #[serde(default)]
@@ -33,7 +34,11 @@ pub fn definitions() -> Vec<Tool> {
     vec![
         tool::<LoadTraceRequest>(
             "ttd_load_trace",
-            "Load a .run or .ttd trace for offline replay.",
+            "Load a .run/.idx/.ttd trace for offline replay.",
+        ),
+        tool::<TraceListRequest>(
+            "ttd_trace_list",
+            "Enumerate traces inside a .run/.idx/.ttd file or trace pack without opening a replay session.",
         ),
         tool::<SessionArg>("ttd_close_trace", "Close an offline TTD trace session."),
         tool::<SessionArg>(
@@ -43,6 +48,18 @@ pub fn definitions() -> Vec<Tool> {
         tool::<SessionArg>(
             "ttd_capabilities",
             "Return backend features available for a loaded TTD trace session.",
+        ),
+        tool::<IndexStatusRequest>(
+            "ttd_index_status",
+            "Return TTD index status for a loaded trace session.",
+        ),
+        tool::<IndexStatsRequest>(
+            "ttd_index_stats",
+            "Return TTD index file statistics for a loaded trace session.",
+        ),
+        tool::<IndexBuildRequest>(
+            "ttd_build_index",
+            "Synchronously build the TTD index for a loaded trace session.",
         ),
         tool::<SessionArg>(
             "ttd_list_threads",
@@ -134,7 +151,7 @@ pub fn definitions() -> Vec<Tool> {
         ),
         tool::<MemoryWatchpointRequest>(
             "ttd_memory_watchpoint",
-            "Find the previous or next read/write/execute access to a guest memory range.",
+            "Find the previous or next access matching a TTD DataAccessMask for a guest memory range.",
         ),
     ]
 }
@@ -144,6 +161,10 @@ pub async fn call(registry: &mut SessionRegistry, call: ToolCall) -> anyhow::Res
         "ttd_load_trace" => {
             let request = parse::<LoadTraceRequest>(call.arguments)?;
             Ok(serde_json::to_value(registry.load_trace(request)?)?)
+        }
+        "ttd_trace_list" => {
+            let request = parse::<TraceListRequest>(call.arguments)?;
+            Ok(serde_json::to_value(registry.list_trace_file(request)?)?)
         }
         "ttd_close_trace" => {
             let request = parse::<SessionArg>(call.arguments)?;
@@ -161,6 +182,18 @@ pub async fn call(registry: &mut SessionRegistry, call: ToolCall) -> anyhow::Res
             Ok(serde_json::to_value(
                 registry.capabilities(request.session_id)?,
             )?)
+        }
+        "ttd_index_status" => {
+            let request = parse::<IndexStatusRequest>(call.arguments)?;
+            Ok(serde_json::to_value(registry.index_status(request)?)?)
+        }
+        "ttd_index_stats" => {
+            let request = parse::<IndexStatsRequest>(call.arguments)?;
+            Ok(serde_json::to_value(registry.index_stats(request)?)?)
+        }
+        "ttd_build_index" => {
+            let request = parse::<IndexBuildRequest>(call.arguments)?;
+            Ok(serde_json::to_value(registry.build_index(request)?)?)
         }
         "ttd_list_threads" => {
             let request = parse::<SessionArg>(call.arguments)?;

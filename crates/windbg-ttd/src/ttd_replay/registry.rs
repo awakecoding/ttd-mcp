@@ -47,6 +47,22 @@ pub struct CursorCreated {
     pub position: Position,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub session_id: SessionId,
+    pub trace_path: std::path::PathBuf,
+    pub backend: String,
+    pub cursor_count: usize,
+    pub cursors: Vec<CursorSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorSummary {
+    pub cursor_id: CursorId,
+    pub position: Position,
+    pub native: bool,
+}
+
 impl SessionRegistry {
     pub fn load_trace(&mut self, request: LoadTraceRequest) -> anyhow::Result<LoadTraceResponse> {
         validate_trace_path(&request.trace_path)?;
@@ -54,8 +70,10 @@ impl SessionRegistry {
         let session_id = self.allocate_session_id();
         let symbols = request.symbols.resolve_for_process();
         let symbol_path = symbols.symbol_path.clone();
-        let (info, native) = match try_open_native_trace(&request.trace_path, &symbols) {
+        let needs_trace_list = request.trace_index.is_some() || request.companion_path.is_some();
+        let (info, native) = match try_open_native_trace(&request, &symbols) {
             Ok((info, native)) => (info, Some(native)),
+            Err(error) if needs_trace_list => return Err(error),
             Err(error) => (
                 placeholder_trace_info(request.trace_path.clone(), error),
                 None,
@@ -81,11 +99,56 @@ impl SessionRegistry {
         })
     }
 
+    pub fn list_trace_file(&self, request: TraceListRequest) -> anyhow::Result<TraceListResponse> {
+        validate_trace_path(&request.trace_path)?;
+        NativeBridge::load()?.list_traces(&request.trace_path, request.companion_path.as_deref())
+    }
+
     pub fn close_trace(&mut self, session_id: SessionId) -> anyhow::Result<()> {
         self.sessions
             .remove(&session_id)
             .map(|_| ())
             .ok_or_else(|| anyhow::anyhow!("unknown session id: {session_id}"))
+    }
+
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn cursor_count(&self) -> usize {
+        self.sessions
+            .values()
+            .map(|session| session.cursors.len())
+            .sum()
+    }
+
+    pub fn session_summaries(&self) -> Vec<SessionSummary> {
+        let mut sessions = self
+            .sessions
+            .iter()
+            .map(|(session_id, session)| {
+                let mut cursors = session
+                    .cursors
+                    .iter()
+                    .map(|(cursor_id, cursor)| CursorSummary {
+                        cursor_id: *cursor_id,
+                        position: cursor.position,
+                        native: cursor.native.is_some(),
+                    })
+                    .collect::<Vec<_>>();
+                cursors.sort_by_key(|cursor| cursor.cursor_id);
+
+                SessionSummary {
+                    session_id: *session_id,
+                    trace_path: session.info.trace_path.clone(),
+                    backend: session.info.backend.clone(),
+                    cursor_count: cursors.len(),
+                    cursors,
+                }
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by_key(|session| session.session_id);
+        sessions
     }
 
     pub fn trace_info(&self, session_id: SessionId) -> anyhow::Result<TraceInfo> {
@@ -120,6 +183,10 @@ impl SessionRegistry {
             symbols: session.symbols.clone(),
             features: ReplayCapabilities {
                 trace_info: true,
+                trace_list: native,
+                index_status: native,
+                index_stats: native,
+                build_index: native,
                 close_trace: true,
                 list_threads: native,
                 list_modules: native,
@@ -159,6 +226,31 @@ impl SessionRegistry {
             },
             limitations,
         })
+    }
+
+    pub fn index_status(&self, request: IndexStatusRequest) -> anyhow::Result<IndexStatusResponse> {
+        let session = self.session(request.session_id)?;
+        let Some(native) = session.native.as_ref() else {
+            bail!("ttd_index_status requires a native TTD replay session")
+        };
+        native.index_status(request.session_id)
+    }
+
+    pub fn index_stats(&self, request: IndexStatsRequest) -> anyhow::Result<IndexStatsResponse> {
+        let session = self.session(request.session_id)?;
+        let Some(native) = session.native.as_ref() else {
+            bail!("ttd_index_stats requires a native TTD replay session")
+        };
+        native.index_file_stats(request.session_id)
+    }
+
+    pub fn build_index(&self, request: IndexBuildRequest) -> anyhow::Result<IndexBuildResponse> {
+        let session = self.session(request.session_id)?;
+        let Some(native) = session.native.as_ref() else {
+            bail!("ttd_build_index requires a native TTD replay session")
+        };
+        let raw_flags = index_build_flags(&request.flags)?;
+        native.build_index(request.session_id, raw_flags, request.flags)
     }
 
     pub fn list_threads(&self, session_id: SessionId) -> anyhow::Result<Vec<TraceThread>> {
@@ -749,14 +841,7 @@ impl SessionRegistry {
             bail!("ttd_memory_watchpoint requires a native TTD replay cursor")
         };
 
-        let result = native.memory_watchpoint(
-            request.session_id,
-            request.cursor_id,
-            request.address,
-            request.size,
-            request.access,
-            request.direction,
-        )?;
+        let result = native.memory_watchpoint(&request)?;
         cursor.position = result.position;
         Ok(result)
     }
@@ -1024,18 +1109,58 @@ fn hex_u64(value: u64) -> String {
 }
 
 fn try_open_native_trace(
-    trace_path: &Path,
+    request: &LoadTraceRequest,
     symbols: &ResolvedSymbolConfig,
 ) -> anyhow::Result<(TraceInfo, NativeTrace)> {
     let bridge = NativeBridge::load()?;
-    let native = bridge.open_trace(trace_path, symbols)?;
+    let trace_index = request.trace_index.unwrap_or_default();
+    let needs_trace_list = request.trace_index.is_some() || request.companion_path.is_some();
+    let trace_metadata =
+        match bridge.list_traces(&request.trace_path, request.companion_path.as_deref()) {
+            Ok(traces) => traces
+                .traces
+                .into_iter()
+                .find(|trace| trace.index == trace_index),
+            Err(error) if needs_trace_list => return Err(error),
+            Err(_) => None,
+        };
+    if needs_trace_list && trace_metadata.is_none() {
+        bail!("trace index {trace_index} was not found");
+    }
+
+    let native = if needs_trace_list {
+        bridge.open_trace_at_index(
+            &request.trace_path,
+            request.companion_path.as_deref(),
+            trace_index,
+            symbols,
+        )?
+    } else {
+        bridge.open_trace(&request.trace_path, symbols)?
+    };
     let info = native.trace_info()?;
+    let trace_file = trace_metadata
+        .as_ref()
+        .map(|metadata| metadata.file.clone());
+    let trace_session_id = trace_metadata
+        .as_ref()
+        .map(|metadata| metadata.session_id.clone());
+    let trace_group_id = trace_metadata
+        .as_ref()
+        .map(|metadata| metadata.group_id.clone());
+    let recording_type = trace_metadata
+        .as_ref()
+        .map(|metadata| metadata.recording_type.clone());
 
     Ok((
         TraceInfo {
-            trace_path: trace_path.to_path_buf(),
+            trace_path: request.trace_path.clone(),
             backend: "ttd-replay-native".to_string(),
             index_status: "loaded".to_string(),
+            trace_file,
+            trace_session_id,
+            trace_group_id,
+            recording_type,
             process_id: info.process_id(),
             peb_address: info.peb_address(),
             lifetime_start: info.lifetime_start(),
@@ -1060,6 +1185,10 @@ fn placeholder_trace_info(
         trace_path: trace_path.into(),
         backend: "unavailable-native-bridge".to_string(),
         index_status: "unknown".to_string(),
+        trace_file: None,
+        trace_session_id: None,
+        trace_group_id: None,
+        recording_type: None,
         process_id: None,
         peb_address: None,
         lifetime_start: Position::MIN,
@@ -1083,10 +1212,27 @@ fn validate_trace_path(path: &Path) -> anyhow::Result<()> {
         .unwrap_or_default()
         .to_ascii_lowercase();
     ensure!(
-        matches!(extension.as_str(), "run" | "ttd"),
-        "trace_path must point to a .run or .ttd trace"
+        matches!(extension.as_str(), "run" | "idx" | "ttd"),
+        "trace_path must point to a .run, .idx, or .ttd trace file"
     );
     Ok(())
+}
+
+fn index_build_flags(flags: &[String]) -> anyhow::Result<u32> {
+    let mut raw_flags = 0;
+    for flag in flags {
+        raw_flags |= match flag.as_str() {
+            "delete_existing_unloadable" | "delete-existing-unloadable" => 0x01,
+            "temporary" | "temporary_index_file" | "temporary-index-file" => 0x02,
+            "self_contained" | "self-contained" | "make_self_contained" | "make-self-contained" => {
+                0x04
+            }
+            "all" => 0x01 | 0x02 | 0x04,
+            "none" => 0,
+            other => bail!("unsupported index build flag: {other}"),
+        };
+    }
+    Ok(raw_flags)
 }
 
 trait ModuleListExt {
@@ -1109,7 +1255,7 @@ mod tests {
     #[test]
     fn rejects_non_ttd_extensions() {
         let error = validate_trace_path(Path::new("trace.dmp")).unwrap_err();
-        assert!(error.to_string().contains(".run or .ttd"));
+        assert!(error.to_string().contains(".run, .idx, or .ttd"));
     }
 
     #[test]
@@ -1118,10 +1264,42 @@ mod tests {
         let loaded = registry
             .load_trace(LoadTraceRequest {
                 trace_path: PathBuf::from("sample.run"),
+                companion_path: None,
+                trace_index: None,
                 symbols: SymbolSettings::default(),
             })
             .unwrap();
         let cursor = registry.create_cursor(loaded.session_id).unwrap();
         assert_eq!(cursor.position, Position::MIN);
+    }
+
+    #[test]
+    fn trace_index_load_errors_instead_of_placeholder() {
+        let mut registry = SessionRegistry::default();
+        let error = registry
+            .load_trace(LoadTraceRequest {
+                trace_path: PathBuf::from("sample.run"),
+                companion_path: None,
+                trace_index: Some(7),
+                symbols: SymbolSettings::default(),
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("trace")
+                || error.to_string().contains("native")
+                || error.to_string().contains("bridge"),
+            "unexpected trace-index error: {error}"
+        );
+    }
+
+    #[test]
+    fn parses_index_build_flags() {
+        let flags = vec![
+            "delete-existing-unloadable".to_string(),
+            "temporary".to_string(),
+            "self_contained".to_string(),
+        ];
+        assert_eq!(index_build_flags(&flags).unwrap(), 0x07);
+        assert!(index_build_flags(&["unknown".to_string()]).is_err());
     }
 }

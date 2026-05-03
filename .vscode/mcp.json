@@ -1,9 +1,9 @@
 {
 	"servers": {
-		"ttd-mcp": {
+		"windbg-ttd": {
 			"type": "stdio",
-			"command": "D:\\\\dev\\\\ttd-mcp\\\\target\\\\release\\\\ttd-mcp.exe",
-			"args": []
+			"command": "D:\\\\dev\\\\windbg-tool\\\\target\\\\release\\\\windbg-tool.exe",
+			"args": ["mcp"]
 		}
 	},
 	"inputs": []

@@ -1,10 +1,11 @@
 use super::types::{
-    ActiveThreadState, CursorRegisters, CursorThreadState, MemoryAccessDirection, MemoryAccessKind,
-    MemoryAccessMask, MemoryBufferRange, MemoryBufferResponse, MemoryRangeResponse,
+    ActiveThreadState, CursorRegisters, CursorThreadState, IndexBuildProgress, IndexStatsResponse,
+    IndexStatusResponse, IndexTreeStats, MemoryAccessDirection, MemoryAccessKind, MemoryAccessMask,
+    MemoryBufferRange, MemoryBufferResponse, MemoryRangeResponse, MemoryWatchpointRequest,
     MemoryWatchpointResponse, ModuleEventKind, QueryMemoryPolicy, ReadMemoryResponse,
     RegisterContextResponse, StepDirection, StepKind, StepResult, ThreadEventKind, TraceException,
-    TraceModule, TraceModuleEvent, TraceThread, TraceThreadEvent, VectorRegister128,
-    VectorRegister256, X64RegisterSet,
+    TraceFileInfo, TraceListEntry, TraceListResponse, TraceModule, TraceModuleEvent, TraceThread,
+    TraceThreadEvent, VectorRegister128, VectorRegister256, X64RegisterSet,
 };
 use super::{Position, ResolvedSymbolConfig};
 use anyhow::{bail, Context};
@@ -18,6 +19,7 @@ const NATIVE_BRIDGE_DLL: &str = "ttd_replay_bridge.dll";
 const TTD_MCP_OK: i32 = 0;
 const MODULE_NAME_CHARS: usize = 260;
 const MODULE_PATH_CHARS: usize = 1024;
+const TRACE_FILE_CHARS: usize = 1024;
 const EXCEPTION_PARAMETER_COUNT: usize = 15;
 
 #[repr(C)]
@@ -53,6 +55,66 @@ struct TtdMcpSymbolConfig {
     image_path: *const u16,
     symbol_cache_dir: *const u16,
     symbol_runtime_dir: *const u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TtdMcpGuid {
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TtdMcpTraceFileInfo {
+    file_type: u32,
+    file_name: [u16; TRACE_FILE_CHARS],
+    companion_file_name: [u16; TRACE_FILE_CHARS],
+    trace_index: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TtdMcpTraceListEntry {
+    session_id: TtdMcpGuid,
+    group_id: TtdMcpGuid,
+    recording_type: u32,
+    file_info: TtdMcpTraceFileInfo,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TtdMcpIndexBuildProgress {
+    keyframe_count: u32,
+    keyframes_processed: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TtdMcpIndexTreeStats {
+    page_size: u64,
+    page_count: u64,
+    inner_page_count: u64,
+    inner_page_entry_count: u64,
+    inner_page_entry_capacity: u64,
+    inner_page_entry_size: u64,
+    leaf_page_count: u64,
+    leaf_page_entry_count: u64,
+    leaf_page_entry_capacity: u64,
+    leaf_page_entry_size: u64,
+    maximum_leaf_depth: u64,
+    sum_of_leaf_depths: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TtdMcpIndexFileStats {
+    global_memory: TtdMcpIndexTreeStats,
+    segment_memory: TtdMcpIndexTreeStats,
+    map_page_call_count: u64,
+    lock_page_call_count: u64,
 }
 
 #[repr(C)]
@@ -260,7 +322,20 @@ struct TtdMcpMemoryWatchpointResult {
 
 type OpenTraceFn =
     unsafe extern "C" fn(*const u16, *const TtdMcpSymbolConfig, *mut *mut TtdMcpTrace) -> i32;
+type OpenTraceAtIndexFn = unsafe extern "C" fn(
+    *const u16,
+    *const u16,
+    u32,
+    *const TtdMcpSymbolConfig,
+    *mut *mut TtdMcpTrace,
+) -> i32;
 type CloseTraceFn = unsafe extern "C" fn(*mut TtdMcpTrace);
+type ListTracesFn =
+    unsafe extern "C" fn(*const u16, *const u16, *mut TtdMcpTraceListEntry, u32, *mut u32) -> i32;
+type IndexStatusFn = unsafe extern "C" fn(*mut TtdMcpTrace, *mut u32) -> i32;
+type IndexFileStatsFn = unsafe extern "C" fn(*mut TtdMcpTrace, *mut TtdMcpIndexFileStats) -> i32;
+type BuildIndexFn =
+    unsafe extern "C" fn(*mut TtdMcpTrace, u32, *mut TtdMcpIndexBuildProgress, *mut u32) -> i32;
 type TraceInfoFn = unsafe extern "C" fn(*mut TtdMcpTrace, *mut TtdMcpTraceInfo) -> i32;
 type ListThreadsFn =
     unsafe extern "C" fn(*mut TtdMcpTrace, *mut TtdMcpThreadInfo, u32, *mut u32) -> i32;
@@ -313,6 +388,7 @@ type MemoryWatchpointFn = unsafe extern "C" fn(
     u32,
     u32,
     u32,
+    u64,
     *mut TtdMcpMemoryWatchpointResult,
 ) -> i32;
 type LastErrorFn = unsafe extern "C" fn() -> *const i8;
@@ -396,6 +472,93 @@ impl NativeBridge {
         })
     }
 
+    pub fn open_trace_at_index(
+        self: &Arc<Self>,
+        trace_path: &Path,
+        companion_path: Option<&Path>,
+        trace_index: u32,
+        symbols: &ResolvedSymbolConfig,
+    ) -> anyhow::Result<NativeTrace> {
+        let trace_path = wide_path(trace_path);
+        let companion_path = companion_path.map(wide_path).unwrap_or_else(wide_empty);
+        let symbol_path = wide_str(&symbols.symbol_path);
+        let image_path = wide_str(&symbols.image_path);
+        let symbol_cache_dir = wide_path(&symbols.symbol_cache_dir);
+        let symbol_runtime_dir = symbols
+            .symbol_runtime_dir
+            .as_ref()
+            .map(|path| wide_path(path))
+            .unwrap_or_else(wide_empty);
+
+        let config = TtdMcpSymbolConfig {
+            symbol_path: symbol_path.as_ptr(),
+            image_path: image_path.as_ptr(),
+            symbol_cache_dir: symbol_cache_dir.as_ptr(),
+            symbol_runtime_dir: symbol_runtime_dir.as_ptr(),
+        };
+
+        let mut handle = std::ptr::null_mut();
+        let open_trace_at_index: Symbol<OpenTraceAtIndexFn> =
+            unsafe { self.symbol(b"ttd_mcp_open_trace_at_index\0")? };
+        let status = unsafe {
+            open_trace_at_index(
+                trace_path.as_ptr(),
+                companion_path.as_ptr(),
+                trace_index,
+                &config,
+                &mut handle,
+            )
+        };
+        self.ensure_ok(status, "opening TTD trace from trace list")?;
+        let handle = NonNull::new(handle).context("native bridge returned a null trace handle")?;
+
+        Ok(NativeTrace {
+            bridge: Arc::clone(self),
+            handle,
+        })
+    }
+
+    pub fn list_traces(
+        &self,
+        trace_path: &Path,
+        companion_path: Option<&Path>,
+    ) -> anyhow::Result<TraceListResponse> {
+        let trace_path_wide = wide_path(trace_path);
+        let companion_path_wide = companion_path.map(wide_path).unwrap_or_else(wide_empty);
+        let list_traces: Symbol<ListTracesFn> = unsafe { self.symbol(b"ttd_mcp_list_traces\0")? };
+        let mut count = 0;
+        let status = unsafe {
+            list_traces(
+                trace_path_wide.as_ptr(),
+                companion_path_wide.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                &mut count,
+            )
+        };
+        self.ensure_ok(status, "querying trace-list count")?;
+
+        let mut traces = vec![TtdMcpTraceListEntry::default(); count as usize];
+        let status = unsafe {
+            list_traces(
+                trace_path_wide.as_ptr(),
+                companion_path_wide.as_ptr(),
+                traces.as_mut_ptr(),
+                count,
+                &mut count,
+            )
+        };
+        self.ensure_ok(status, "listing traces")?;
+        traces.truncate(count as usize);
+
+        Ok(TraceListResponse {
+            trace_path: trace_path.to_path_buf(),
+            companion_path: companion_path.map(Path::to_path_buf),
+            trace_count: traces.len(),
+            traces: traces.into_iter().map(TraceListEntry::from).collect(),
+        })
+    }
+
     unsafe fn symbol<T>(&self, name: &[u8]) -> anyhow::Result<Symbol<'_, T>> {
         self.library
             .get(name)
@@ -440,6 +603,63 @@ impl NativeTrace {
         let status = unsafe { trace_info(self.handle.as_ptr(), &mut info) };
         self.bridge.ensure_ok(status, "reading trace info")?;
         Ok(info)
+    }
+
+    pub fn index_status(&self, session_id: u64) -> anyhow::Result<IndexStatusResponse> {
+        let index_status: Symbol<IndexStatusFn> =
+            unsafe { self.bridge.symbol(b"ttd_mcp_index_status\0")? };
+        let mut raw_status = 0;
+        let status = unsafe { index_status(self.handle.as_ptr(), &mut raw_status) };
+        self.bridge.ensure_ok(status, "reading index status")?;
+        Ok(IndexStatusResponse {
+            session_id,
+            status: index_status_name(raw_status).to_string(),
+            raw_status,
+        })
+    }
+
+    pub fn index_file_stats(&self, session_id: u64) -> anyhow::Result<IndexStatsResponse> {
+        let index_file_stats: Symbol<IndexFileStatsFn> =
+            unsafe { self.bridge.symbol(b"ttd_mcp_index_file_stats\0")? };
+        let mut stats = TtdMcpIndexFileStats::default();
+        let status = unsafe { index_file_stats(self.handle.as_ptr(), &mut stats) };
+        self.bridge.ensure_ok(status, "reading index file stats")?;
+        Ok(IndexStatsResponse {
+            session_id,
+            global_memory: stats.global_memory.into(),
+            segment_memory: stats.segment_memory.into(),
+            map_page_call_count: stats.map_page_call_count,
+            lock_page_call_count: stats.lock_page_call_count,
+        })
+    }
+
+    pub fn build_index(
+        &self,
+        session_id: u64,
+        raw_flags: u32,
+        flags: Vec<String>,
+    ) -> anyhow::Result<super::types::IndexBuildResponse> {
+        let build_index: Symbol<BuildIndexFn> =
+            unsafe { self.bridge.symbol(b"ttd_mcp_build_index\0")? };
+        let mut progress = TtdMcpIndexBuildProgress::default();
+        let mut raw_status = 0;
+        let status = unsafe {
+            build_index(
+                self.handle.as_ptr(),
+                raw_flags,
+                &mut progress,
+                &mut raw_status,
+            )
+        };
+        self.bridge.ensure_ok(status, "building index")?;
+        Ok(super::types::IndexBuildResponse {
+            session_id,
+            status: index_status_name(raw_status).to_string(),
+            raw_status,
+            flags,
+            raw_flags,
+            progress: progress.into(),
+        })
     }
 
     pub fn new_cursor(&self) -> anyhow::Result<NativeCursor> {
@@ -914,17 +1134,12 @@ impl NativeCursor {
 
     pub fn memory_watchpoint(
         &self,
-        session_id: u64,
-        cursor_id: u64,
-        address: u64,
-        size: u32,
-        access: MemoryAccessMask,
-        direction: MemoryAccessDirection,
+        request: &MemoryWatchpointRequest,
     ) -> anyhow::Result<MemoryWatchpointResponse> {
         let memory_watchpoint: Symbol<MemoryWatchpointFn> =
             unsafe { self.bridge.symbol(b"ttd_mcp_memory_watchpoint\0")? };
-        let native_access = native_memory_access_mask(access);
-        let native_direction = match direction {
+        let native_access = native_memory_access_mask(request.access);
+        let native_direction = match request.direction {
             MemoryAccessDirection::Next => 0,
             MemoryAccessDirection::Previous => 1,
             MemoryAccessDirection::Unknown => bail!("direction must be 'previous' or 'next'"),
@@ -933,10 +1148,11 @@ impl NativeCursor {
         let status = unsafe {
             memory_watchpoint(
                 self.handle.as_ptr(),
-                address,
-                size,
+                request.address,
+                request.size,
                 native_access,
                 native_direction,
+                request.thread_unique_id.unwrap_or_default(),
                 &mut result,
             )
         };
@@ -945,12 +1161,13 @@ impl NativeCursor {
 
         let found = result.found != 0;
         Ok(MemoryWatchpointResponse {
-            session_id,
-            cursor_id,
-            requested_address: address,
-            requested_size: size,
-            requested_access: access,
-            direction,
+            session_id: request.session_id,
+            cursor_id: request.cursor_id,
+            requested_address: request.address,
+            requested_size: request.size,
+            requested_access: request.access,
+            requested_thread_unique_id: request.thread_unique_id,
+            direction: request.direction,
             found,
             position: result.position.into(),
             previous_position: valid_position(result.previous_position).map(Into::into),
@@ -994,6 +1211,71 @@ impl From<Position> for TtdMcpPosition {
         Self {
             sequence: position.sequence,
             steps: position.steps,
+        }
+    }
+}
+
+impl Default for TtdMcpTraceFileInfo {
+    fn default() -> Self {
+        Self {
+            file_type: 0,
+            file_name: [0; TRACE_FILE_CHARS],
+            companion_file_name: [0; TRACE_FILE_CHARS],
+            trace_index: 0,
+        }
+    }
+}
+
+impl From<TtdMcpTraceListEntry> for TraceListEntry {
+    fn from(entry: TtdMcpTraceListEntry) -> Self {
+        Self {
+            index: entry.file_info.trace_index,
+            session_id: guid_string(entry.session_id),
+            group_id: guid_string(entry.group_id),
+            recording_type: recording_type_name(entry.recording_type).to_string(),
+            file: entry.file_info.into(),
+        }
+    }
+}
+
+impl From<TtdMcpTraceFileInfo> for TraceFileInfo {
+    fn from(info: TtdMcpTraceFileInfo) -> Self {
+        let file_name = utf16_fixed_to_string(&info.file_name);
+        let companion_file_name = utf16_fixed_to_string(&info.companion_file_name);
+        Self {
+            file_type: trace_file_type_name(info.file_type).to_string(),
+            file_name: (!file_name.is_empty()).then(|| PathBuf::from(file_name)),
+            companion_file_name: (!companion_file_name.is_empty())
+                .then(|| PathBuf::from(companion_file_name)),
+            trace_index: info.trace_index,
+        }
+    }
+}
+
+impl From<TtdMcpIndexTreeStats> for IndexTreeStats {
+    fn from(stats: TtdMcpIndexTreeStats) -> Self {
+        Self {
+            page_size: stats.page_size,
+            page_count: stats.page_count,
+            inner_page_count: stats.inner_page_count,
+            inner_page_entry_count: stats.inner_page_entry_count,
+            inner_page_entry_capacity: stats.inner_page_entry_capacity,
+            inner_page_entry_size: stats.inner_page_entry_size,
+            leaf_page_count: stats.leaf_page_count,
+            leaf_page_entry_count: stats.leaf_page_entry_count,
+            leaf_page_entry_capacity: stats.leaf_page_entry_capacity,
+            leaf_page_entry_size: stats.leaf_page_entry_size,
+            maximum_leaf_depth: stats.maximum_leaf_depth,
+            sum_of_leaf_depths: stats.sum_of_leaf_depths,
+        }
+    }
+}
+
+impl From<TtdMcpIndexBuildProgress> for IndexBuildProgress {
+    fn from(progress: TtdMcpIndexBuildProgress) -> Self {
+        Self {
+            keyframe_count: progress.keyframe_count,
+            keyframes_processed: progress.keyframes_processed,
         }
     }
 }
@@ -1375,10 +1657,16 @@ fn query_memory_policy_code(policy: QueryMemoryPolicy) -> u32 {
 
 fn native_memory_access_mask(access: MemoryAccessMask) -> u32 {
     match access {
-        MemoryAccessMask::Read => 0,
-        MemoryAccessMask::Write => 1,
-        MemoryAccessMask::Execute => 2,
-        MemoryAccessMask::ReadWrite => 3,
+        MemoryAccessMask::Read => 0x01,
+        MemoryAccessMask::Write => 0x02,
+        MemoryAccessMask::Execute => 0x04,
+        MemoryAccessMask::CodeFetch => 0x08,
+        MemoryAccessMask::Overwrite => 0x10,
+        MemoryAccessMask::DataMismatch => 0x20,
+        MemoryAccessMask::NewData => 0x40,
+        MemoryAccessMask::RedundantData => 0x80,
+        MemoryAccessMask::ReadWrite => 0x03,
+        MemoryAccessMask::All => 0xff,
     }
 }
 
@@ -1410,6 +1698,51 @@ fn stop_reason_name(stop_reason: u32) -> &'static str {
         9 => "Error",
         _ => "Unknown",
     }
+}
+
+fn recording_type_name(value: u32) -> &'static str {
+    match value {
+        0 => "invalid",
+        1 => "full",
+        2 => "selective",
+        3 => "chunk",
+        _ => "unknown",
+    }
+}
+
+fn index_status_name(value: u32) -> &'static str {
+    match value {
+        0 => "loaded",
+        1 => "not_present",
+        2 => "unloadable",
+        _ => "unknown",
+    }
+}
+
+fn trace_file_type_name(value: u32) -> &'static str {
+    match value {
+        0 => "trace",
+        1 => "index",
+        2 => "pack",
+        _ => "unknown",
+    }
+}
+
+fn guid_string(guid: TtdMcpGuid) -> String {
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        guid.data1,
+        guid.data2,
+        guid.data3,
+        guid.data4[0],
+        guid.data4[1],
+        guid.data4[2],
+        guid.data4[3],
+        guid.data4[4],
+        guid.data4[5],
+        guid.data4[6],
+        guid.data4[7],
+    )
 }
 
 #[cfg(windows)]
