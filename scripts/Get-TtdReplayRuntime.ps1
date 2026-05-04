@@ -6,6 +6,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 
 $resolvedOutDir = Resolve-Path -Path $OutDir -ErrorAction SilentlyContinue
 if ($null -eq $resolvedOutDir) {

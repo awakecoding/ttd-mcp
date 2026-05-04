@@ -1,0 +1,172 @@
+name: Windows packages
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  package:
+    name: Package ${{ matrix.label }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x64
+            rust_target: x86_64-pc-windows-msvc
+            nuget_arch: amd64
+            vcvars_arch: x64
+            artifact: windbg-tool-windows-x64
+            can_run: true
+          - label: windows-arm64
+            rust_target: aarch64-pc-windows-msvc
+            nuget_arch: arm64
+            vcvars_arch: x64_arm64
+            artifact: windbg-tool-windows-arm64
+            can_run: false
+
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: -C target-feature=+crt-static
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Select stable Rust
+        shell: pwsh
+        run: |
+          rustup default stable
+          rustup target add ${{ matrix.rust_target }}
+
+      - name: Restore debugger dependencies
+        shell: pwsh
+        run: cargo xtask deps --arch ${{ matrix.nuget_arch }}
+
+      - name: Ensure ARM64 MSVC toolset
+        if: matrix.nuget_arch == 'arm64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $installer = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vs_installer.exe'
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe was not found at $vswhere"
+          }
+          if (-not (Test-Path $installer)) {
+            throw "vs_installer.exe was not found at $installer"
+          }
+          $installationPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installationPath) {
+            throw 'Could not find a Visual Studio installation with the MSVC x64 toolset'
+          }
+          & $installer modify `
+            --installPath $installationPath `
+            --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 `
+            --quiet `
+            --norestart `
+            --nocache `
+            --wait
+          if (($LASTEXITCODE -ne 0) -and ($LASTEXITCODE -ne 3010)) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Build native bridge
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $installationPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installationPath) {
+            throw 'Could not find a Visual Studio installation with the MSVC x64 toolset'
+          }
+          $vcvars = Join-Path $installationPath 'VC\Auxiliary\Build\vcvarsall.bat'
+          cmd /c "`"$vcvars`" ${{ matrix.vcvars_arch }} && cargo xtask native-build --arch ${{ matrix.nuget_arch }} --static-crt"
+
+      - name: Build windbg-tool
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $installationPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installationPath) {
+            throw 'Could not find a Visual Studio installation with the MSVC x64 toolset'
+          }
+          $vcvars = Join-Path $installationPath 'VC\Auxiliary\Build\vcvarsall.bat'
+          cmd /c "`"$vcvars`" ${{ matrix.vcvars_arch }} && cargo build -p windbg-tool --release --target ${{ matrix.rust_target }}"
+
+      - name: Package runtime files
+        shell: pwsh
+        run: |
+          cargo xtask package `
+            --arch ${{ matrix.nuget_arch }} `
+            --target ${{ matrix.rust_target }} `
+            --profile release `
+            --out "target\package\${{ matrix.artifact }}"
+
+      - name: Validate package and create ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $packageDir = Join-Path $PWD 'target\package\${{ matrix.artifact }}'
+          $zipPath = Join-Path $PWD 'target\package\${{ matrix.artifact }}.zip'
+          $requiredFiles = @(
+            'windbg-tool.exe',
+            'ttd_replay_bridge.dll',
+            'TTDReplay.dll',
+            'TTDReplayCPU.dll',
+            'dbgeng.dll',
+            'dbgcore.dll',
+            'dbghelp.dll',
+            'dbgmodel.dll',
+            'msdia140.dll',
+            'symsrv.dll',
+            'srcsrv.dll'
+          )
+
+          foreach ($file in $requiredFiles) {
+            $path = Join-Path $packageDir $file
+            if (-not (Test-Path $path)) {
+              throw "Package is missing required file: $file"
+            }
+          }
+
+          if ('${{ matrix.can_run }}' -eq 'true') {
+            Push-Location $packageDir
+            try {
+              & '.\windbg-tool.exe' discover | Out-Null
+            }
+            finally {
+              Pop-Location
+            }
+          }
+
+          if (Test-Path $zipPath) {
+            Remove-Item $zipPath -Force
+          }
+          Compress-Archive -Path (Join-Path $packageDir '*') -DestinationPath $zipPath -Force
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            $entries = @($zip.Entries | ForEach-Object { $_.FullName.Replace('/', '\') })
+            foreach ($file in $requiredFiles) {
+              if ($entries -notcontains $file) {
+                throw "ZIP is missing required file: $file"
+              }
+            }
+          }
+          finally {
+            $zip.Dispose()
+          }
+
+      - name: Upload package
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact }}
+          path: target\package\${{ matrix.artifact }}.zip
+          if-no-files-found: error

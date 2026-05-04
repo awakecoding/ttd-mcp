@@ -41,6 +41,8 @@ The built executable is:
 target\debug\windbg-tool.exe
 ```
 
+Release ZIP artifacts are built by the Windows packaging workflow. The local equivalent uses `cargo xtask deps --arch <amd64|arm64>`, `cargo xtask native-build --arch <amd64|arm64> --static-crt`, a release build for the matching MSVC Rust target, and `cargo xtask package --profile release`.
+
 For deeper setup, test commands, runtime details, and workspace notes, see [the development guide](docs/development.md).
 
 ## CLI quick start

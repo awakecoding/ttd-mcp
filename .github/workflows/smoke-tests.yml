@@ -13,7 +13,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Select stable Rust
         shell: pwsh
@@ -110,7 +110,7 @@ jobs:
 
       - name: Upload dump on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ping-dump-smoke
           path: ${{ runner.temp }}\windbg-tool-smoke\ping.dmp

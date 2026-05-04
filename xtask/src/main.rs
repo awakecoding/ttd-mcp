@@ -38,17 +38,193 @@ const SYMBOL_RUNTIME_FILES: &[SymbolRuntimeFile] = &[
     },
 ];
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageArch {
+    Amd64,
+    Arm64,
+}
+
+impl PackageArch {
+    fn from_value(value: &str) -> anyhow::Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "amd64" | "x64" | "x86_64" => Ok(Self::Amd64),
+            "arm64" | "aarch64" => Ok(Self::Arm64),
+            _ => bail!("unsupported package architecture: {value}"),
+        }
+    }
+
+    fn from_rust_target(target: &str) -> anyhow::Result<Self> {
+        if target.starts_with("x86_64-") {
+            Ok(Self::Amd64)
+        } else if target.starts_with("aarch64-") {
+            Ok(Self::Arm64)
+        } else {
+            bail!("unsupported Windows Rust target: {target}")
+        }
+    }
+
+    fn host() -> Self {
+        if env::var("PROCESSOR_ARCHITECTURE")
+            .map(|arch| arch.eq_ignore_ascii_case("ARM64"))
+            .unwrap_or(false)
+        {
+            Self::Arm64
+        } else {
+            Self::Amd64
+        }
+    }
+
+    fn nuget_arch(self) -> &'static str {
+        match self {
+            Self::Amd64 => "amd64",
+            Self::Arm64 => "arm64",
+        }
+    }
+
+    fn ttd_arch(self) -> &'static str {
+        match self {
+            Self::Amd64 => "x64",
+            Self::Arm64 => "arm64",
+        }
+    }
+
+    fn msvc_platform(self) -> &'static str {
+        match self {
+            Self::Amd64 => "x64",
+            Self::Arm64 => "ARM64",
+        }
+    }
+
+    fn rust_target(self) -> &'static str {
+        match self {
+            Self::Amd64 => "x86_64-pc-windows-msvc",
+            Self::Arm64 => "aarch64-pc-windows-msvc",
+        }
+    }
+
+    fn package_label(self) -> &'static str {
+        match self {
+            Self::Amd64 => "windows-x64",
+            Self::Arm64 => "windows-arm64",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct XtaskOptions {
+    arch: PackageArch,
+    explicit_target_layout: bool,
+    rust_target: Option<String>,
+    profile: String,
+    package_dir: Option<PathBuf>,
+    static_crt: bool,
+}
+
+impl XtaskOptions {
+    fn parse(args: &[String]) -> anyhow::Result<Self> {
+        let mut arch = None;
+        let mut rust_target = None;
+        let mut profile = String::from("debug");
+        let mut package_dir = None;
+        let mut static_crt = false;
+        let mut explicit_target_layout = false;
+
+        let mut index = 0;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--arch" => {
+                    index += 1;
+                    let value = args.get(index).context("--arch requires a value")?;
+                    arch = Some(PackageArch::from_value(value)?);
+                    explicit_target_layout = true;
+                }
+                "--target" => {
+                    index += 1;
+                    let value = args.get(index).context("--target requires a value")?;
+                    rust_target = Some(value.clone());
+                    explicit_target_layout = true;
+                }
+                "--profile" => {
+                    index += 1;
+                    let value = args.get(index).context("--profile requires a value")?;
+                    ensure!(
+                        value == "debug" || value == "release",
+                        "--profile must be 'debug' or 'release'"
+                    );
+                    profile = value.clone();
+                }
+                "--out" | "--package-dir" => {
+                    index += 1;
+                    let value = args.get(index).context("--out requires a value")?;
+                    package_dir = Some(PathBuf::from(value));
+                }
+                "--static-crt" => {
+                    static_crt = true;
+                }
+                option => bail!("unknown xtask option: {option}"),
+            }
+            index += 1;
+        }
+
+        let inferred_arch = match (&arch, &rust_target) {
+            (Some(arch), Some(target)) => {
+                let target_arch = PackageArch::from_rust_target(target)?;
+                ensure!(
+                    *arch == target_arch,
+                    "--arch {} does not match --target {}",
+                    arch.nuget_arch(),
+                    target
+                );
+                *arch
+            }
+            (Some(arch), None) => *arch,
+            (None, Some(target)) => PackageArch::from_rust_target(target)?,
+            (None, None) => PackageArch::host(),
+        };
+
+        let rust_target = if explicit_target_layout {
+            Some(rust_target.unwrap_or_else(|| inferred_arch.rust_target().to_string()))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            arch: inferred_arch,
+            explicit_target_layout,
+            rust_target,
+            profile,
+            package_dir,
+            static_crt,
+        })
+    }
+
+    fn default_host() -> Self {
+        Self {
+            arch: PackageArch::host(),
+            explicit_target_layout: false,
+            rust_target: None,
+            profile: String::from("debug"),
+            package_dir: None,
+            static_crt: false,
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let mut args = env::args().skip(1);
-    match args.next().as_deref() {
+    let command = args.next();
+    let rest = args.collect::<Vec<_>>();
+    match command.as_deref() {
         Some("doctor") => doctor(),
-        Some("deps") => deps(),
-        Some("native-build") => native_build(),
-        Some("package") => package(),
+        Some("deps") => deps(&XtaskOptions::parse(&rest)?),
+        Some("native-build") => native_build(&XtaskOptions::parse(&rest)?),
+        Some("package") => package(&XtaskOptions::parse(&rest)?),
         Some("mcp-smoke") => mcp_smoke(),
         Some(command) => bail!("unknown xtask command: {command}"),
         None => {
-            eprintln!("Usage: cargo xtask <doctor|deps|native-build|package|mcp-smoke>");
+            eprintln!(
+                "Usage: cargo xtask <doctor|deps|native-build|package|mcp-smoke> [--arch amd64|arm64] [--target <triple>] [--profile debug|release] [--out <dir>] [--static-crt]"
+            );
             Ok(())
         }
     }
@@ -103,7 +279,7 @@ fn doctor() -> anyhow::Result<()> {
     check_file(&test_trace);
     check_file(&root.join("traces/ping/ping.exe"));
 
-    if let Some(path) = native_bridge_candidates(&root)
+    if let Some(path) = native_bridge_candidates(&root, &XtaskOptions::default_host())
         .into_iter()
         .find(|path| path.is_file())
     {
@@ -115,7 +291,7 @@ fn doctor() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn deps() -> anyhow::Result<()> {
+fn deps(options: &XtaskOptions) -> anyhow::Result<()> {
     let root = workspace_root()?;
     let packages_config = root.join("native/ttd-replay-bridge/packages.config");
     let packages_dir = root.join("target/nuget");
@@ -128,10 +304,18 @@ fn deps() -> anyhow::Result<()> {
         .arg(&packages_dir))
     .context("restoring native NuGet packages")?;
 
-    stage_symbol_runtime(&packages_dir, &root.join("target/symbol-runtime"))
-        .context("staging symbol runtime DLLs")?;
-    stage_dbgeng_runtime(&packages_dir, &root.join("target/dbgeng-runtime"))
-        .context("staging DbgEng runtime DLLs")?;
+    stage_symbol_runtime(
+        &packages_dir,
+        &symbol_runtime_dir(&root, options),
+        options.arch,
+    )
+    .context("staging symbol runtime DLLs")?;
+    stage_dbgeng_runtime(
+        &packages_dir,
+        &dbgeng_runtime_dir(&root, options),
+        options.arch,
+    )
+    .context("staging DbgEng runtime DLLs")?;
 
     run(Command::new("powershell")
         .arg("-ExecutionPolicy")
@@ -139,18 +323,20 @@ fn deps() -> anyhow::Result<()> {
         .arg("-File")
         .arg(root.join("scripts/Get-TtdReplayRuntime.ps1"))
         .arg("-OutDir")
-        .arg(root.join("target/ttd-runtime")))
+        .arg(ttd_runtime_dir(&root, options))
+        .arg("-Arch")
+        .arg(options.arch.ttd_arch()))
     .context("downloading TTD replay runtime")?;
 
     Ok(())
 }
 
-fn native_build() -> anyhow::Result<()> {
+fn native_build(options: &XtaskOptions) -> anyhow::Result<()> {
     let root = workspace_root()?;
     let packages_dir = root.join("target/nuget");
     let ttd_apis_package = package_dir(&packages_dir, "Microsoft.TimeTravelDebugging.Apis")?;
     let source_dir = root.join("native/ttd-replay-bridge");
-    let build_dir = root.join("target/native/ttd-replay-bridge");
+    let build_dir = native_build_dir(&root, options);
     fs::create_dir_all(&build_dir).context("creating native bridge build directory")?;
 
     let mut configure = Command::new("cmake");
@@ -163,10 +349,14 @@ fn native_build() -> anyhow::Result<()> {
             "-DTTD_APIS_PACKAGE_DIR={}",
             ttd_apis_package.display()
         ))
-        .env("Platform", msvc_platform());
+        .env("Platform", options.arch.msvc_platform());
+
+    if options.static_crt {
+        configure.arg("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>");
+    }
 
     if cfg!(windows) && cmake_generator_accepts_platform() {
-        configure.arg("-A").arg(msvc_platform());
+        configure.arg("-A").arg(options.arch.msvc_platform());
     }
 
     run(&mut configure).context("configuring native TTD replay bridge")?;
@@ -181,31 +371,38 @@ fn native_build() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn package() -> anyhow::Result<()> {
+fn package(options: &XtaskOptions) -> anyhow::Result<()> {
     let root = workspace_root()?;
-    let package_dir = root.join("target/package");
+    let package_dir = options
+        .package_dir
+        .clone()
+        .unwrap_or_else(|| default_package_dir(&root, options));
+    if package_dir.exists() {
+        fs::remove_dir_all(&package_dir)
+            .with_context(|| format!("clearing package directory {}", package_dir.display()))?;
+    }
     fs::create_dir_all(&package_dir).context("creating package directory")?;
     copy_if_exists(
-        &root.join("target/debug/windbg-tool.exe"),
+        &windbg_tool_exe(&root, options),
         &package_dir.join("windbg-tool.exe"),
     )?;
     copy_first_existing(
-        native_bridge_candidates(&root),
+        native_bridge_candidates(&root, options),
         &package_dir.join(NATIVE_BRIDGE_DLL),
     )?;
     copy_runtime_files(
-        &root.join("target/ttd-runtime"),
+        &ttd_runtime_dir(&root, options),
         &package_dir,
         TTD_RUNTIME_FILES,
     )?;
     for file in SYMBOL_RUNTIME_FILES {
         copy_if_exists(
-            &root.join("target/symbol-runtime").join(file.dll),
+            &symbol_runtime_dir(&root, options).join(file.dll),
             &package_dir.join(file.dll),
         )?;
     }
     copy_runtime_files(
-        &root.join("target/dbgeng-runtime"),
+        &dbgeng_runtime_dir(&root, options),
         &package_dir,
         DBGENG_RUNTIME_FILES,
     )?;
@@ -220,7 +417,7 @@ fn mcp_smoke() -> anyhow::Result<()> {
         .arg("-p")
         .arg("windbg-tool"))
     .context("building windbg-tool before packaged MCP smoke test")?;
-    package().context("preparing MCP package directory")?;
+    package(&XtaskOptions::default_host()).context("preparing MCP package directory")?;
 
     let package_dir = root.join("target/package");
     let server_path = package_dir.join("windbg-tool.exe");
@@ -332,12 +529,15 @@ fn check_file(path: &Path) {
     }
 }
 
-fn stage_symbol_runtime(packages_dir: &Path, symbol_runtime_dir: &Path) -> anyhow::Result<()> {
-    fs::create_dir_all(symbol_runtime_dir).context("creating target/symbol-runtime")?;
-    let arch = native_package_arch();
-
+fn stage_symbol_runtime(
+    packages_dir: &Path,
+    symbol_runtime_dir: &Path,
+    arch: PackageArch,
+) -> anyhow::Result<()> {
+    fs::create_dir_all(symbol_runtime_dir)
+        .with_context(|| format!("creating {}", symbol_runtime_dir.display()))?;
     for file in SYMBOL_RUNTIME_FILES {
-        let source = package_content_file(packages_dir, file.package, file.dll, arch)?;
+        let source = package_content_file(packages_dir, file.package, file.dll, arch.nuget_arch())?;
         let destination = symbol_runtime_dir.join(file.dll);
         fs::copy(&source, &destination).with_context(|| {
             format!("copying {} to {}", source.display(), destination.display())
@@ -348,15 +548,19 @@ fn stage_symbol_runtime(packages_dir: &Path, symbol_runtime_dir: &Path) -> anyho
     Ok(())
 }
 
-fn stage_dbgeng_runtime(packages_dir: &Path, dbgeng_runtime_dir: &Path) -> anyhow::Result<()> {
-    fs::create_dir_all(dbgeng_runtime_dir).context("creating target/dbgeng-runtime")?;
-    let arch = native_package_arch();
+fn stage_dbgeng_runtime(
+    packages_dir: &Path,
+    dbgeng_runtime_dir: &Path,
+    arch: PackageArch,
+) -> anyhow::Result<()> {
+    fs::create_dir_all(dbgeng_runtime_dir)
+        .with_context(|| format!("creating {}", dbgeng_runtime_dir.display()))?;
     for dll in DBGENG_RUNTIME_FILES {
         let source = package_content_file(
             packages_dir,
             "Microsoft.Debugging.Platform.DbgEng",
             dll,
-            arch,
+            arch.nuget_arch(),
         )?;
         let destination = dbgeng_runtime_dir.join(dll);
         fs::copy(&source, &destination).with_context(|| {
@@ -408,41 +612,78 @@ fn package_dir(packages_dir: &Path, package: &str) -> anyhow::Result<PathBuf> {
     )
 }
 
-fn native_package_arch() -> &'static str {
-    if env::var("PROCESSOR_ARCHITECTURE")
-        .map(|arch| arch.eq_ignore_ascii_case("ARM64"))
-        .unwrap_or(false)
-    {
-        "arm64"
-    } else {
-        "amd64"
-    }
-}
-
-fn msvc_platform() -> &'static str {
-    if env::var("PROCESSOR_ARCHITECTURE")
-        .map(|arch| arch.eq_ignore_ascii_case("ARM64"))
-        .unwrap_or(false)
-    {
-        "ARM64"
-    } else {
-        "x64"
-    }
-}
-
 fn cmake_generator_accepts_platform() -> bool {
     env::var("CMAKE_GENERATOR")
         .map(|generator| !generator.to_ascii_lowercase().contains("ninja"))
         .unwrap_or(true)
 }
 
-fn native_bridge_candidates(root: &Path) -> Vec<PathBuf> {
+fn runtime_root(root: &Path, options: &XtaskOptions) -> PathBuf {
+    root.join("target/runtime").join(options.arch.nuget_arch())
+}
+
+fn symbol_runtime_dir(root: &Path, options: &XtaskOptions) -> PathBuf {
+    if options.explicit_target_layout {
+        runtime_root(root, options).join("symbol-runtime")
+    } else {
+        root.join("target/symbol-runtime")
+    }
+}
+
+fn dbgeng_runtime_dir(root: &Path, options: &XtaskOptions) -> PathBuf {
+    if options.explicit_target_layout {
+        runtime_root(root, options).join("dbgeng-runtime")
+    } else {
+        root.join("target/dbgeng-runtime")
+    }
+}
+
+fn ttd_runtime_dir(root: &Path, options: &XtaskOptions) -> PathBuf {
+    if options.explicit_target_layout {
+        runtime_root(root, options).join("ttd-runtime")
+    } else {
+        root.join("target/ttd-runtime")
+    }
+}
+
+fn native_build_dir(root: &Path, options: &XtaskOptions) -> PathBuf {
+    if options.explicit_target_layout {
+        root.join("target/native")
+            .join(format!("ttd-replay-bridge-{}", options.arch.nuget_arch()))
+    } else {
+        root.join("target/native/ttd-replay-bridge")
+    }
+}
+
+fn default_package_dir(root: &Path, options: &XtaskOptions) -> PathBuf {
+    if options.explicit_target_layout {
+        root.join("target/package")
+            .join(options.arch.package_label())
+    } else {
+        root.join("target/package")
+    }
+}
+
+fn windbg_tool_exe(root: &Path, options: &XtaskOptions) -> PathBuf {
+    if let Some(rust_target) = &options.rust_target {
+        root.join("target")
+            .join(rust_target)
+            .join(&options.profile)
+            .join("windbg-tool.exe")
+    } else {
+        root.join("target")
+            .join(&options.profile)
+            .join("windbg-tool.exe")
+    }
+}
+
+fn native_bridge_candidates(root: &Path, options: &XtaskOptions) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(path) = env::var_os("TTD_NATIVE_BRIDGE_DLL").map(PathBuf::from) {
         candidates.push(path);
     }
 
-    let build_dir = root.join("target/native/ttd-replay-bridge");
+    let build_dir = native_build_dir(root, options);
     candidates.push(build_dir.join("bin/Release").join(NATIVE_BRIDGE_DLL));
     candidates.push(build_dir.join("bin/Debug").join(NATIVE_BRIDGE_DLL));
     candidates.push(build_dir.join("Release").join(NATIVE_BRIDGE_DLL));

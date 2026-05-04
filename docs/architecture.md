@@ -27,7 +27,7 @@ cargo xtask deps
 
 or run [scripts/Get-TtdReplayRuntime.ps1](../scripts/Get-TtdReplayRuntime.ps1) directly.
 
-The native bridge has a CMake project at [native/ttd-replay-bridge/CMakeLists.txt](../native/ttd-replay-bridge/CMakeLists.txt). `cargo xtask native-build` configures it against the restored `Microsoft.TimeTravelDebugging.Apis` package and emits the bridge under `target/native/ttd-replay-bridge`.
+The native bridge has a CMake project at [native/ttd-replay-bridge/CMakeLists.txt](../native/ttd-replay-bridge/CMakeLists.txt). `cargo xtask native-build` configures it against the restored `Microsoft.TimeTravelDebugging.Apis` package and emits the bridge under `target/native/ttd-replay-bridge`. Release packaging can pass `--arch amd64` or `--arch arm64` plus `--static-crt` so cross-compiled packages use the matching native bridge and statically link the MSVC runtime.
 
 ## Symbols
 
@@ -37,7 +37,7 @@ The default symbol path is equivalent to:
 srv*.ttd-symbol-cache*https://msdl.microsoft.com/download/symbols
 ```
 
-`cargo xtask deps` stages `dbghelp.dll`, `symsrv.dll`, and `srcsrv.dll` from Microsoft Debugging Platform NuGet packages into `target/symbol-runtime`, and stages DbgEng process-server runtime DLLs into `target/dbgeng-runtime`. Keep this repo-local and process-local; do not set machine-wide `_NT_SYMBOL_PATH` or write debugger registry keys as part of normal server operation. If `_NT_SYMBOL_PATH` is already set in the server process environment, use it as a fallback only when the MCP request does not provide explicit `symbols.symbol_paths`.
+`cargo xtask deps` stages `dbghelp.dll`, `symsrv.dll`, and `srcsrv.dll` from Microsoft Debugging Platform NuGet packages into `target/symbol-runtime`, and stages DbgEng process-server runtime DLLs into `target/dbgeng-runtime`. Architecture-explicit release staging uses `target/runtime/<arch>/...` to keep x64 and ARM64 DLLs separate. Keep this repo-local and process-local; do not set machine-wide `_NT_SYMBOL_PATH` or write debugger registry keys as part of normal server operation. If `_NT_SYMBOL_PATH` is already set in the server process environment, use it as a fallback only when the MCP request does not provide explicit `symbols.symbol_paths`.
 
 Callers can provide additional binary paths, symbol paths, and a symbol cache directory when loading a trace. Public symbols are useful for module/function names. Private symbols are needed for richer function signatures and local details.
 
