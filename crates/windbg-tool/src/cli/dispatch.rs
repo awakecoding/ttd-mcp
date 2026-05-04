@@ -41,6 +41,8 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
         },
         Some(Commands::Dump { command }) => match command {
             DumpCommand::Open(args) => dump_open_and_print(pipe, args, &output).await,
+            DumpCommand::Inspect(args) => platform::run_dump_inspect(args, &output),
+            DumpCommand::Create(args) => platform::run_dump_create(args, &output),
         },
         Some(Commands::DbgSrv(args)) => platform::run_dbgeng_server(args, &output),
         Some(Commands::Remote { command }) => {
@@ -287,6 +289,9 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
                     &output,
                 )
                 .await
+            }
+            TargetCommand::Dump(args) => {
+                call_and_print(pipe, target_dump_call(args), &output).await
             }
         },
         Some(Commands::Disasm(args)) => disasm_and_print(pipe, args, &output).await,

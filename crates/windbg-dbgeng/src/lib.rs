@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{bail, Context};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -37,6 +37,27 @@ pub struct DumpOpenOptions {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct DumpWriteOptions {
+    pub path: PathBuf,
+    pub kind: DumpKind,
+    pub overwrite: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessDumpOptions {
+    pub process_id: u32,
+    pub initial_break_timeout_ms: u32,
+    pub write: DumpWriteOptions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DumpKind {
+    Mini,
+    Full,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LiveLaunchEnd {
@@ -59,6 +80,18 @@ pub struct LiveLaunchResult {
     pub execution_status: Option<u32>,
     pub execution_status_name: Option<String>,
     pub end: LiveLaunchEnd,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DumpWriteResult {
+    pub path: PathBuf,
+    pub kind: DumpKind,
+    pub qualifier: u32,
+    pub format_flags: u32,
+    pub overwrite: bool,
+    pub target: String,
+    pub process_id: Option<u32>,
+    pub detached: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -196,6 +229,10 @@ pub fn open_dump_session(options: DumpOpenOptions) -> anyhow::Result<DebuggerSes
     open_dump_session_impl(options)
 }
 
+pub fn write_process_dump(options: ProcessDumpOptions) -> anyhow::Result<DumpWriteResult> {
+    write_process_dump_impl(options)
+}
+
 #[cfg(windows)]
 pub struct DebuggerSession {
     kind: DebuggerSessionKind,
@@ -279,6 +316,18 @@ impl DebuggerSession {
             self.client.TerminateProcesses()?;
         }
         Ok(())
+    }
+
+    pub fn write_dump(&self, options: DumpWriteOptions) -> anyhow::Result<DumpWriteResult> {
+        if self.kind != DebuggerSessionKind::Live {
+            bail!("DbgEng dump writing requires a live target session");
+        }
+        let process_id = self
+            .current_process_system_id()
+            .ok()
+            .or(self.process_id)
+            .context("no process id is available for this live target")?;
+        write_process_dump_file(process_id, self.target.clone(), false, options)
     }
 
     pub fn core_registers(&self) -> anyhow::Result<CoreRegisterState> {
@@ -699,6 +748,10 @@ impl DebuggerSession {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 
+    pub fn write_dump(&self, _options: DumpWriteOptions) -> anyhow::Result<DumpWriteResult> {
+        anyhow::bail!("DbgEng dump writing is only supported on Windows")
+    }
+
     pub fn core_registers(&self) -> anyhow::Result<CoreRegisterState> {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
@@ -953,6 +1006,17 @@ fn open_dump_session_impl(options: DumpOpenOptions) -> anyhow::Result<DebuggerSe
 }
 
 #[cfg(windows)]
+fn write_process_dump_impl(options: ProcessDumpOptions) -> anyhow::Result<DumpWriteResult> {
+    let _ = options.initial_break_timeout_ms;
+    write_process_dump_file(
+        options.process_id,
+        format!("pid:{}", options.process_id),
+        false,
+        options.write,
+    )
+}
+
+#[cfg(windows)]
 fn read_wide_string<F>(mut reader: F) -> anyhow::Result<String>
 where
     F: FnMut(&mut [u16], Option<*mut u32>) -> windows::core::Result<()>,
@@ -999,6 +1063,26 @@ fn debug_value_type_name(value_type: u32) -> &'static str {
     }
 }
 
+const DEBUG_DUMP_SMALL_VALUE: u32 = 1024;
+const DEBUG_DUMP_DEFAULT_VALUE: u32 = 1025;
+const DEBUG_FORMAT_DEFAULT_VALUE: u32 = 0x0000_0000;
+const DEBUG_FORMAT_NO_OVERWRITE_VALUE: u32 = 0x8000_0000;
+
+fn dump_kind_qualifier(kind: DumpKind) -> u32 {
+    match kind {
+        DumpKind::Mini => DEBUG_DUMP_SMALL_VALUE,
+        DumpKind::Full => DEBUG_DUMP_DEFAULT_VALUE,
+    }
+}
+
+fn dump_format_flags(overwrite: bool) -> u32 {
+    if overwrite {
+        DEBUG_FORMAT_DEFAULT_VALUE
+    } else {
+        DEBUG_FORMAT_NO_OVERWRITE_VALUE
+    }
+}
+
 fn encode_hex(bytes: &[u8]) -> String {
     let mut result = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -1006,6 +1090,92 @@ fn encode_hex(bytes: &[u8]) -> String {
         let _ = write!(&mut result, "{byte:02x}");
     }
     result
+}
+
+#[cfg(windows)]
+fn write_process_dump_file(
+    process_id: u32,
+    target: String,
+    detached: bool,
+    options: DumpWriteOptions,
+) -> anyhow::Result<DumpWriteResult> {
+    use std::fs::OpenOptions;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Diagnostics::Debug::{
+        MiniDumpWithDataSegs, MiniDumpWithFullMemory, MiniDumpWithFullMemoryInfo,
+        MiniDumpWithHandleData, MiniDumpWithProcessThreadData, MiniDumpWithThreadInfo,
+        MiniDumpWithUnloadedModules, MiniDumpWriteDump, MINIDUMP_TYPE,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+    };
+
+    if !options.overwrite && options.path.exists() {
+        bail!("dump output already exists: {}", options.path.display());
+    }
+
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+            false,
+            process_id,
+        )?
+    };
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(options.overwrite)
+        .create_new(!options.overwrite)
+        .open(&options.path)
+        .with_context(|| format!("failed to create dump file: {}", options.path.display()))?;
+
+    let dump_type = match options.kind {
+        DumpKind::Mini => MINIDUMP_TYPE(0),
+        DumpKind::Full => {
+            MiniDumpWithFullMemory
+                | MiniDumpWithHandleData
+                | MiniDumpWithUnloadedModules
+                | MiniDumpWithProcessThreadData
+                | MiniDumpWithFullMemoryInfo
+                | MiniDumpWithThreadInfo
+                | MiniDumpWithDataSegs
+        }
+    };
+
+    let write_result = unsafe {
+        MiniDumpWriteDump(
+            process,
+            process_id,
+            HANDLE(file.as_raw_handle()),
+            dump_type,
+            None,
+            None,
+            None,
+        )
+    };
+    unsafe {
+        CloseHandle(process)?;
+    }
+    if let Err(error) = write_result {
+        return Err(error).context("MiniDumpWriteDump failed");
+    }
+    drop(file);
+    let metadata = std::fs::metadata(&options.path)
+        .with_context(|| format!("dump file was not created: {}", options.path.display()))?;
+    if metadata.len() == 0 {
+        bail!("created an empty dump file: {}", options.path.display());
+    }
+    Ok(DumpWriteResult {
+        path: options.path,
+        kind: options.kind,
+        qualifier: dump_kind_qualifier(options.kind),
+        format_flags: dump_format_flags(options.overwrite),
+        overwrite: options.overwrite,
+        target,
+        process_id: Some(process_id),
+        detached,
+    })
 }
 
 #[cfg(not(windows))]
@@ -1036,4 +1206,27 @@ fn attach_live_session_impl(options: LiveAttachOptions) -> anyhow::Result<Debugg
 fn open_dump_session_impl(options: DumpOpenOptions) -> anyhow::Result<DebuggerSession> {
     let _ = options;
     anyhow::bail!("DbgEng dump sessions are only supported on Windows")
+}
+
+#[cfg(not(windows))]
+fn write_process_dump_impl(options: ProcessDumpOptions) -> anyhow::Result<DumpWriteResult> {
+    let _ = options;
+    anyhow::bail!("DbgEng dump writing is only supported on Windows")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_dump_kinds_to_dbgeng_qualifiers() {
+        assert_eq!(dump_kind_qualifier(DumpKind::Mini), 1024);
+        assert_eq!(dump_kind_qualifier(DumpKind::Full), 1025);
+    }
+
+    #[test]
+    fn uses_no_overwrite_by_default() {
+        assert_eq!(dump_format_flags(false), 0x8000_0000);
+        assert_eq!(dump_format_flags(true), 0);
+    }
 }

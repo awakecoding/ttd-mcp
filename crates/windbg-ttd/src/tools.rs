@@ -4,7 +4,7 @@ use crate::targets::{
     DumpOpenRequest, LiveAttachRequest, LiveLaunchRequest, TargetAddressRequest,
     TargetBreakpointRemoveRequest, TargetBreakpointSetRequest, TargetDisassembleRequest,
     TargetExpressionRequest, TargetMemoryReadRequest, TargetRequest, TargetStackTraceRequest,
-    TargetWaitRequest,
+    TargetWaitRequest, TargetWriteDumpRequest,
 };
 use crate::ttd_replay::{
     AddressInfoRequest, CursorId, IndexBuildRequest, IndexStatsRequest, IndexStatusRequest,
@@ -250,6 +250,10 @@ pub fn definitions() -> Vec<Tool> {
         tool::<TargetExpressionRequest>(
             "target_evaluate_expression",
             "Evaluate a DbgEng expression against a daemon-owned live or dump target session.",
+        ),
+        tool::<TargetWriteDumpRequest>(
+            "target_write_dump",
+            "Write a process dump from a daemon-owned live target session.",
         ),
         tool::<SweepWatchMemoryJobRequest>(
             "job_start_watch_memory_sweep",
@@ -537,6 +541,10 @@ pub async fn call(state: &mut ServiceState, call: ToolCall) -> anyhow::Result<Va
         "target_evaluate_expression" => {
             let request = parse::<TargetExpressionRequest>(call.arguments)?;
             Ok(serde_json::to_value(state.targets.evaluate(request)?)?)
+        }
+        "target_write_dump" => {
+            let request = parse::<TargetWriteDumpRequest>(call.arguments)?;
+            Ok(serde_json::to_value(state.targets.write_dump(request)?)?)
         }
         _ => bail!("unknown tool: {}", call.name),
     }

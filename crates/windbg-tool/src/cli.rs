@@ -260,6 +260,10 @@ enum LiveCommand {
 enum DumpCommand {
     #[command(about = "Open a dump file as a daemon-owned target")]
     Open(DumpOpenArgs),
+    #[command(about = "Open and inspect a dump file without the daemon")]
+    Inspect(DumpInspectArgs),
+    #[command(about = "Create a process dump from a live process id")]
+    Create(DumpCreateArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -396,6 +400,8 @@ enum TargetCommand {
         about = "Resolve source file and line information for a daemon-owned target address"
     )]
     Source(TargetAddressArgs),
+    #[command(about = "Write a process dump from a daemon-owned live target")]
+    Dump(TargetDumpArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -525,6 +531,27 @@ struct DumpOpenArgs {
 }
 
 #[derive(Debug, Args)]
+struct DumpCreateArgs {
+    #[arg(long, help = "Process id to dump through DbgEng")]
+    process_id: u32,
+    #[arg(long, value_name = "PATH", help = "Output .dmp path")]
+    output: PathBuf,
+    #[arg(long, value_enum, default_value_t = CliDumpKind::Mini)]
+    kind: CliDumpKind,
+    #[arg(long, help = "Allow replacing an existing dump file")]
+    overwrite: bool,
+    #[arg(long, default_value_t = 5000)]
+    initial_break_timeout_ms: u32,
+}
+
+#[derive(Debug, Args)]
+struct DumpInspectArgs {
+    path: PathBuf,
+    #[arg(long, default_value_t = 8)]
+    max_frames: u32,
+}
+
+#[derive(Debug, Args)]
 struct RemoteExplainArgs {
     #[arg(long, value_enum)]
     kind: Option<RemoteKind>,
@@ -559,6 +586,12 @@ struct RemoteConnectCommandArgs {
 enum RemoteKind {
     Dbgsrv,
     Ntsd,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliDumpKind {
+    Mini,
+    Full,
 }
 
 #[derive(Debug, Args)]
@@ -728,6 +761,18 @@ struct TargetMemoryReadArgs {
     address: String,
     #[arg(long)]
     size: u32,
+}
+
+#[derive(Debug, Args)]
+struct TargetDumpArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(long, value_name = "PATH", help = "Output .dmp path")]
+    output: PathBuf,
+    #[arg(long, value_enum, default_value_t = CliDumpKind::Mini)]
+    kind: CliDumpKind,
+    #[arg(long, help = "Allow replacing an existing dump file")]
+    overwrite: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1329,8 +1374,8 @@ async fn target_capabilities_and_print(
                 {
                     "kind": "live_dbgeng_one_shot",
                     "status": "partial",
-                    "entry": "live launch",
-                    "supports": ["launch", "initial_debug_event_status", "detach_or_terminate"],
+                    "entry": ["live launch", "dump create"],
+                    "supports": ["launch", "initial_debug_event_status", "detach_or_terminate", "process_dump_create"],
                     "missing": ["persistence", "attach", "interactive session control"]
                 },
                 {
@@ -1353,7 +1398,8 @@ async fn target_capabilities_and_print(
                         "source_lookup",
                         "disassembly",
                         "breakpoints",
-                        "expression_evaluation"
+                        "expression_evaluation",
+                        "dump_write"
                     ],
                     "missing": ["event_streaming", "step_over", "step_out", "symbol_breakpoints", "output_capture"]
                 },
@@ -2674,7 +2720,7 @@ fn discover_manifest() -> Value {
                 "live start --command-line <cmd>",
                 "live attach --process-id <pid>"
             ],
-            "dump": ["dump open <path>"],
+            "dump": ["dump open <path>", "dump inspect <path>", "dump create --process-id <pid> --output <path>"],
             "job": [
                 "job list",
                 "job status --job <id>",
@@ -2705,6 +2751,7 @@ fn discover_manifest() -> Value {
                 "target modules --target <id>",
                 "target registers --target <id>",
                 "target memory --target <id> --address <addr> --size <n>",
+                "target dump --target <id> --output <path>",
                 "target stack --target <id>",
                 "target disasm --target <id>",
                 "target symbol --target <id> --address <addr>",
@@ -3061,6 +3108,7 @@ fn tool_command_map() -> Value {
         { "tool": "live_launch_session", "commands": ["live start"] },
         { "tool": "live_attach_process", "commands": ["live attach"] },
         { "tool": "dump_open_session", "commands": ["dump open"] },
+        { "tool": "target_write_dump", "commands": ["target dump"] },
         { "tool": "target_list", "commands": ["target list"] },
         { "tool": "target_status", "commands": ["target status"] },
         { "tool": "target_close", "commands": ["target close"] },
@@ -3250,6 +3298,24 @@ fn command_metadata() -> Value {
             "safety": "read_only_dump_analysis"
         },
         {
+            "command": "dump inspect",
+            "requires_daemon": false,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "opens_dump_and_reads_summary",
+            "safety": "read_only_dump_analysis",
+            "bounds": ["--max-frames"]
+        },
+        {
+            "command": "dump create",
+            "requires_daemon": false,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "opens_process_handle_and_writes_dump",
+            "safety": "process_snapshot_read",
+            "bounds": ["--kind mini|full", "--initial-break-timeout-ms", "--overwrite"]
+        },
+        {
             "command": "target capabilities",
             "requires_daemon": false,
             "requires_native_ttd": false,
@@ -3281,6 +3347,15 @@ fn command_metadata() -> Value {
             "cost": "bounded_memory_read",
             "safety": "read_only_memory",
             "bounds": ["--size"]
+        },
+        {
+            "command": "target dump",
+            "requires_daemon": true,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "writes_dump_from_live_target",
+            "safety": "live_debugging_changes_target_execution_state",
+            "bounds": ["--kind mini|full", "--overwrite"]
         },
         {
             "command": "target stack",
@@ -3516,6 +3591,18 @@ fn target_memory_call(args: TargetMemoryReadArgs) -> anyhow::Result<ToolCall> {
     })
 }
 
+fn target_dump_call(args: TargetDumpArgs) -> ToolCall {
+    ToolCall {
+        name: "target_write_dump".to_string(),
+        arguments: json!({
+            "target_id": args.target,
+            "path": args.output,
+            "kind": cli_dump_kind_name(args.kind),
+            "overwrite": args.overwrite,
+        }),
+    }
+}
+
 fn target_stack_call(args: TargetStackTraceArgs) -> ToolCall {
     ToolCall {
         name: "target_stack_trace".to_string(),
@@ -3523,6 +3610,13 @@ fn target_stack_call(args: TargetStackTraceArgs) -> ToolCall {
             "target_id": args.target,
             "max_frames": args.max_frames,
         }),
+    }
+}
+
+fn cli_dump_kind_name(kind: CliDumpKind) -> &'static str {
+    match kind {
+        CliDumpKind::Mini => "mini",
+        CliDumpKind::Full => "full",
     }
 }
 
@@ -5527,5 +5621,20 @@ mod tests {
         assert_eq!(normalize_dll_name("example.dll")?, "example.dll");
         assert!(normalize_dll_name(r"C:\temp\example.dll").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn builds_target_dump_tool_call() {
+        let call = target_dump_call(TargetDumpArgs {
+            target: 7,
+            output: PathBuf::from(r"C:\dumps\app.dmp"),
+            kind: CliDumpKind::Full,
+            overwrite: true,
+        });
+        assert_eq!(call.name, "target_write_dump");
+        assert_eq!(call.arguments["target_id"], 7);
+        assert_eq!(call.arguments["path"], r"C:\dumps\app.dmp");
+        assert_eq!(call.arguments["kind"], "full");
+        assert_eq!(call.arguments["overwrite"], true);
     }
 }

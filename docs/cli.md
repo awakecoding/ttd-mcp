@@ -74,7 +74,7 @@ target\debug\windbg-tool.exe --compact registers --session 1 --cursor 1
 | Inspect runtime state | `registers`, `register-context`, `active-threads`, `command-line`, `architecture state` |
 | Inspect code and memory | `disasm`, `memory read`, `memory dump`, `memory strings`, `memory dps`, `memory classify`, `memory chase`, `object vtable` |
 | Symbol and source triage | `symbols diagnose`, `symbols inspect`, `symbols exports`, `symbols nearest`, `source resolve` |
-| WinDbg and remote helpers | `remote explain`, `remote server-command`, `remote connect-command`, `dbgeng server`, `live capabilities`, `windbg status` |
+| WinDbg, live, dump, and remote helpers | `remote explain`, `remote server-command`, `remote connect-command`, `dbgeng server`, `live capabilities`, `dump create`, `dump open`, `dump inspect`, `target dump`, `windbg status` |
 
 ## Useful non-replay commands
 

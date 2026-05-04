@@ -46,6 +46,23 @@ cargo xtask native-build
 
 `cargo xtask native-build` configures and builds the C++ bridge under `target\native\ttd-replay-bridge`.
 
+For release packaging, use explicit target architecture inputs so the Rust binary, native bridge, and staged debugger runtime DLLs all match:
+
+```powershell
+$env:RUSTFLAGS = "-C target-feature=+crt-static"
+rustup target add x86_64-pc-windows-msvc
+cargo xtask deps --arch amd64
+cargo xtask native-build --arch amd64 --static-crt
+cargo build -p windbg-tool --release --target x86_64-pc-windows-msvc
+cargo xtask package --arch amd64 --target x86_64-pc-windows-msvc --profile release --out target\package\windbg-tool-windows-x64
+```
+
+Use `--arch arm64` with `--target aarch64-pc-windows-msvc` for the Windows ARM64 package. Architecture-specific dependency staging uses `target\runtime\<arch>\...`, while the legacy no-argument `cargo xtask deps`, `cargo xtask native-build`, and `cargo xtask package` commands keep using the existing host-architecture directories.
+
+Release packages statically link the MSVC C runtime into Rust code with `RUSTFLAGS=-C target-feature=+crt-static` and into the native bridge with `cargo xtask native-build --static-crt`. WinDbg, DbgEng, symbol, and TTD replay runtime DLLs remain dynamic dependencies and are copied into the package directory.
+
+Cross-compiling the ARM64 package from an x64 machine requires the Visual Studio ARM64 MSVC toolset and an `x64_arm64` developer environment for the native bridge and Rust crates that compile C/C++ code.
+
 To smoke-test the packaged MCP server:
 
 ```powershell

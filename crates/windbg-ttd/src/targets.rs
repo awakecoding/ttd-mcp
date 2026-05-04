@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use windbg_dbgeng::{
     attach_live_session, launch_live_session, open_dump_session, BreakpointInfo, CoreRegisterState,
     DebuggerExecutionStatus, DebuggerSession, DebuggerSessionKind, DebuggerSessionSummary,
-    DisassemblyResult, DumpOpenOptions, EvaluationResult, LiveAttachOptions,
-    LiveLaunchSessionOptions, MemoryReadResult, ModuleInfo, SourceLocation, StackFrameInfo,
-    SymbolInfo, ThreadInfo,
+    DisassemblyResult, DumpKind, DumpOpenOptions, DumpWriteOptions, DumpWriteResult,
+    EvaluationResult, LiveAttachOptions, LiveLaunchSessionOptions, MemoryReadResult, ModuleInfo,
+    SourceLocation, StackFrameInfo, SymbolInfo, ThreadInfo,
 };
 
 pub type TargetId = u64;
@@ -86,6 +86,24 @@ pub struct TargetDisassembleRequest {
 pub struct TargetExpressionRequest {
     pub target_id: TargetId,
     pub expression: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TargetWriteDumpRequest {
+    pub target_id: TargetId,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub kind: TargetDumpKind,
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetDumpKind {
+    #[default]
+    Mini,
+    Full,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -203,6 +221,12 @@ pub struct TargetBreakpointChangeResponse {
 pub struct TargetEvaluationResponse {
     pub target_id: TargetId,
     pub evaluation: EvaluationResult,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetWriteDumpResponse {
+    pub target_id: TargetId,
+    pub dump: DumpWriteResult,
 }
 
 impl TargetRegistry {
@@ -483,6 +507,22 @@ impl TargetRegistry {
         })
     }
 
+    pub fn write_dump(
+        &self,
+        request: TargetWriteDumpRequest,
+    ) -> anyhow::Result<TargetWriteDumpResponse> {
+        let target = self.target(request.target_id)?;
+        ensure_live_target(request.target_id, &target.session)?;
+        Ok(TargetWriteDumpResponse {
+            target_id: request.target_id,
+            dump: target.session.write_dump(DumpWriteOptions {
+                path: request.path,
+                kind: request.kind.into(),
+                overwrite: request.overwrite,
+            })?,
+        })
+    }
+
     fn insert_target(&mut self, session: DebuggerSession) -> TargetOpenedResponse {
         let target_id = self.allocate_target_id();
         let target = session.summary();
@@ -523,4 +563,13 @@ fn ensure_live_target(target_id: TargetId, session: &DebuggerSession) -> anyhow:
         bail!("target {target_id} is not a live session")
     }
     Ok(())
+}
+
+impl From<TargetDumpKind> for DumpKind {
+    fn from(kind: TargetDumpKind) -> Self {
+        match kind {
+            TargetDumpKind::Mini => DumpKind::Mini,
+            TargetDumpKind::Full => DumpKind::Full,
+        }
+    }
 }
