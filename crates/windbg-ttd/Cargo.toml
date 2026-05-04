@@ -18,3 +18,4 @@ rmcp.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+windbg-dbgeng = { path = "..\\windbg-dbgeng" }

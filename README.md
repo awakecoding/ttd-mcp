@@ -1,480 +1,121 @@
 # windbg-tool
 
-`windbg-tool` is a single command-line executable for WinDbg-oriented automation. It can run the `windbg-ttd` MCP server, keep long-lived TTD replay sessions in a local daemon, expose agent-friendly TTD client commands, start a DbgEng process server, and download/update/launch WinDbg.
+`windbg-tool` is a Windows-first command-line tool and MCP server for WinDbg-oriented automation. It is centered on Time Travel Debugging (TTD) replay, but it also covers broader WinDbg workflows such as daemon-backed CLI automation, symbol and source diagnostics, disassembly and memory inspection helpers, DbgEng process-server support, remote debugging command generation, and WinDbg install/update/launch.
 
-The project is intentionally Windows-first. TTD replay uses Microsoft's TTD Replay Engine APIs, which are distributed through the `Microsoft.TimeTravelDebugging.Apis` NuGet package and the WinDbg/TTD runtime distribution.
+`windbg-tool` is the product name. You will still see `windbg-ttd` in MCP server configuration and `ttd_*` tool names because the replay/MCP surface grew out of the original TTD-focused implementation.
 
-## Current Status
+## What you can do
 
-This repository contains the first implementation slice:
+- Run a stdio MCP server for TTD replay workflows.
+- Keep long-lived replay sessions in a local daemon and drive them from the CLI.
+- Open traces, create cursors, seek positions, inspect threads/modules/registers/memory, and replay to watchpoints.
+- Use higher-level helpers such as `discover`, `recipes`, `context snapshot`, `symbols diagnose`, `disasm`, `stack backtrace`, and `memory chase`.
+- Start a DbgEng process server and install, update, or launch WinDbg.
 
-- A stdio MCP server in Rust using the official `rmcp` Rust MCP SDK.
-- Tool schemas for trace pack enumeration, trace loading, metadata, cursors, seeking, registers, memory, and watchpoints.
-- A safe Rust replay facade with TTD position parsing and symbol-path handling.
-- A C ABI C++ bridge scaffold for the TTD Replay API.
-- A small DbgEng process-server wrapper exposed through `windbg-tool dbgeng server`.
-- A WinDbg installer/updater/launcher exposed through `windbg-tool windbg ...`.
-- Dependency/runtime acquisition scripts and architecture docs.
+## Repository layout
 
-The native bridge now builds with CMake and the Rust facade uses it when available for trace pack/list enumeration, trace loading and trace-index selection, trace index status/stats/build operations, trace metadata, thread/module/exception/keyframe enumeration, cursor-local module snapshots, module and thread lifecycle event timelines, cursor creation, normal and thread-scoped position get/set, active-thread snapshots, forward/backward stepping, compact and x64 scalar/SIMD cursor register/thread state, bounded memory reads with selectable TTD query policies, trace-backed memory range and buffer provenance queries, memory watchpoint replay, and trace-derived command-line extraction from PEB process parameters.
+| Path | Purpose |
+| --- | --- |
+| `crates\windbg-tool` | Main `windbg-tool.exe` CLI application |
+| `crates\windbg-ttd` | MCP server, daemon, replay facade, and TTD tool surface |
+| `crates\windbg-dbgeng` | DbgEng helpers for live/process-server scenarios |
+| `crates\windbg-install` | WinDbg download, update, and launch support |
+| `native\ttd-replay-bridge` | Narrow C ABI bridge over the Microsoft TTD Replay API |
+| `xtask` | Development workflow commands |
+| `docs\architecture.md` | Architecture and implementation notes |
 
-## Build
+## Build from source
 
-```powershell
-cargo build
-cargo test --workspace
-```
-
-## Dependency Setup
-
-Run this from a Visual Studio Developer PowerShell or another shell with `nuget`, `cmake`, `msbuild`, and `powershell` available:
+For a local build with the native replay pieces available:
 
 ```powershell
 cargo xtask doctor
 cargo xtask deps
 cargo xtask native-build
+cargo build -p windbg-tool
 ```
 
-`cargo xtask deps` restores native NuGet packages into `target/nuget`, stages `dbghelp.dll`, `symsrv.dll`, and `srcsrv.dll` into `target/symbol-runtime`, stages DbgEng runtime DLLs into `target/dbgeng-runtime`, and downloads `TTDReplay.dll` plus `TTDReplayCPU.dll` into `target/ttd-runtime`.
-
-`cargo xtask native-build` configures and builds the C++ bridge with CMake under `target/native/ttd-replay-bridge`. Run it from an MSVC developer environment so CMake can find the Visual C++ toolchain.
-
-To verify the packaged MCP server over stdio, run:
-
-```powershell
-cargo xtask mcp-smoke
-```
-
-This builds `windbg-tool`, prepares `target/package`, starts `target/package/windbg-tool.exe`, runs the MCP initialize and tools/list flow, and loads the local ping trace when `traces/ping/ping01.run` is available.
-
-## Symbols
-
-Symbol support is configured per trace session. The default symbol path is:
+The built executable is:
 
 ```text
-srv*.ttd-symbol-cache*https://msdl.microsoft.com/download/symbols
+target\debug\windbg-tool.exe
 ```
 
-The server stages DbgHelp/SymSrv/SrcSrv from Microsoft Debugging Platform NuGet packages into `target/symbol-runtime`. It does not set machine-wide `_NT_SYMBOL_PATH` or write debugger registry keys; callers pass binary paths, symbol paths, and cache settings through `ttd_load_trace`. If `symbols.symbol_paths` is empty and `_NT_SYMBOL_PATH` is set in the server process environment, the server uses `_NT_SYMBOL_PATH` as the starting symbol path.
+For deeper setup, test commands, runtime details, and workspace notes, see [the development guide](docs/development.md).
 
-`ttd_load_trace` returns both the legacy `symbol_path` string and a `symbols` object with the resolved symbol path, image path, cache directory, symbol runtime directory, and binary path count. The native bridge ABI accepts the same resolved fields so the replay backend can initialize symbol support without relying on machine-wide debugger settings.
+## CLI quick start
 
-## MCP Configuration
+Some commands work without loading a trace or starting the daemon:
 
-After building, configure your MCP client to launch the server over stdio:
+```powershell
+target\debug\windbg-tool.exe discover
+target\debug\windbg-tool.exe recipes
+target\debug\windbg-tool.exe tools
+```
+
+For trace-driven work, the common flow is:
+
+```powershell
+target\debug\windbg-tool.exe daemon ensure
+target\debug\windbg-tool.exe open C:\path\to\trace.run --binary-path C:\path\to\binary.exe
+target\debug\windbg-tool.exe sessions
+target\debug\windbg-tool.exe context snapshot --session 1 --cursor 1
+target\debug\windbg-tool.exe disasm --session 1 --cursor 1
+```
+
+`open` is the best starting command for the CLI because it loads the trace, creates a cursor, and returns both `session_id` and `cursor_id`. Most replay commands then use `--session` and `--cursor` (or the short forms `-s` and `-c`).
+
+Representative command areas:
+
+- Discovery: `discover`, `recipes`, `tools`, `schema`
+- Session and replay: `open`, `load`, `sessions`, `info`, `position set`, `step`, `replay to`
+- Analysis: `symbols diagnose`, `disasm`, `memory dump`, `memory strings`, `memory chase`, `stack recover`, `stack backtrace`
+- Platform helpers: `remote explain`, `dbgeng server`, `live launch`, `windbg status`
+
+For a fuller CLI walkthrough, output-shaping flags, and command map, see [the CLI guide](docs/cli.md).
+
+## MCP quick start
+
+Run the MCP server over stdio:
+
+```powershell
+target\debug\windbg-tool.exe mcp
+```
+
+Example MCP client configuration:
 
 ```json
 {
   "servers": {
     "windbg-ttd": {
-      "command": "d:/dev/windbg-tool/target/debug/windbg-tool.exe",
+      "command": "D:\\dev\\windbg-tool\\target\\debug\\windbg-tool.exe",
       "args": ["mcp"]
     }
   }
 }
 ```
 
-## Agent CLI Daemon
+The usual MCP flow is:
 
-For repeated agent-driven debugging, use `windbg-tool.exe` as a named-pipe daemon/client pair instead of launching a fresh replay session for every operation. The daemon owns the loaded TTD sessions and cursors, while normal CLI invocations call the daemon over local HTTP carried by a Windows named pipe.
+1. `ttd_load_trace`
+2. `ttd_cursor_create`
+3. `ttd_trace_info`, `ttd_registers`, `ttd_read_memory`, `ttd_memory_watchpoint`, or related tools
 
-Start a daemon in the foreground:
-
-```powershell
-target/debug/windbg-tool.exe daemon start
-```
-
-Or spawn it through the client:
-
-```powershell
-target/debug/windbg-tool.exe daemon ensure
-target/debug/windbg-tool.exe daemon status
-```
-
-`daemon ensure` reuses an existing daemon when one is already listening, or starts a detached daemon when needed.
-
-CLI output is JSON by default. Agent skills can add `--compact` for single-line JSON, `--field <dot.path>` to extract a value, and `--raw` to print scalar fields without JSON quoting:
-
-```powershell
-$session = target/debug/windbg-tool.exe --field session_id --raw open traces\ping\ping01.run --binary-path traces\ping\ping.exe
-$cursor = target/debug/windbg-tool.exe --field sessions.0.cursors.0.cursor_id --raw sessions
-target/debug/windbg-tool.exe position set --session $session --cursor $cursor --position 50
-target/debug/windbg-tool.exe --compact registers --session $session --cursor $cursor
-```
-
-`open` is the preferred first command for agent workflows: it loads a trace, creates a cursor, optionally accepts `--position`, and returns both `session_id` and `cursor_id` in one response. Use `sessions` later to rediscover daemon-owned sessions and cursors. For `.ttd` packs or explicit companion files, first run `trace-list <path>` or `trace list <path>` to inspect trace indices, then pass `--trace-index <n>` and optionally `--companion-path <path>` to `open` or `load`.
-
-Discovery commands work without a running daemon:
-
-```powershell
-target/debug/windbg-tool.exe discover
-target/debug/windbg-tool.exe recipes
-target/debug/windbg-tool.exe context snapshot --session 1 --cursor 1
-target/debug/windbg-tool.exe remote explain
-target/debug/windbg-tool.exe symbols diagnose --session 1
-target/debug/windbg-tool.exe symbols inspect C:\Windows\System32\notepad.exe
-target/debug/windbg-tool.exe symbols exports C:\Windows\System32\kernel32.dll --filter CreateFile
-target/debug/windbg-tool.exe symbols nearest --session 1 --cursor 1 --address 0x7ff612341000
-target/debug/windbg-tool.exe source resolve C:\build\repo\src\main.cpp --search-path D:\src\repo
-target/debug/windbg-tool.exe disasm --session 1 --cursor 1 --count 12
-target/debug/windbg-tool.exe memory chase --session 1 --cursor 1 --address 0x12345678 --depth 8
-target/debug/windbg-tool.exe tools
-target/debug/windbg-tool.exe schema ttd_read_memory
-```
-
-`discover` includes `command_metadata` entries with daemon/native requirements, session/cursor requirements, rough cost, bounds, architecture notes, and safety labels so agent skills can choose cheap read-only commands before expensive replay operations.
-
-Focused commands are thin aliases over the same daemon `tools/call` path used by MCP:
-
-| Area | Commands |
-| --- | --- |
-| Discovery | `discover`, `recipes [topic]`, `advise [topic]`, `tools`, `schema <tool>` |
-| Daemon/context | `daemon ensure`, `daemon start --detach`, `daemon status`, `daemon shutdown`, `sessions`, `context snapshot` |
-| DbgEng | `dbgeng server --transport <transport>`, `dbgsrv --transport <transport>` |
-| Remote debugging | `remote explain`, `remote server-command`, `remote connect-command` |
-| Live debugging | `live capabilities`, `live launch --command-line <cmd> --end detach|terminate` |
-| Breakpoints/data model | `breakpoint capabilities`, `datamodel capabilities` |
-| Targets | `target capabilities`, `target capabilities --session <id> --cursor <id>` |
-| WinDbg | `windbg status`, `windbg install`, `windbg update`, `windbg path`, `windbg run -- <args>` |
-| Session | `open`, `load`, `close`, `info`, `capabilities`, `tool <name>` |
-| Symbols/source | `symbols diagnose`, `symbols inspect`, `symbols exports`, `symbols nearest`, `source resolve` |
-| Index | `index status`, `index stats`, `index build --flag <flag>` |
-| Metadata | `trace-list`, `trace list`, `threads`, `modules`, `keyframes`, `exceptions`, `events modules`, `events threads`, `timeline events`, `module info`, `module audit`, `module search-order` |
-| Cursor/navigation | `cursor create`, `cursor modules`, `position get`, `position set`, `active-threads`, `step`, `replay capabilities`, `replay to`, `replay watch-memory`, `sweep watch-memory` |
-| State | `architecture state`, `arch state`, `registers`, `register-context`, `stack info`, `stack read`, `stack recover`, `stack backtrace`, `command-line`, `address` |
-| Disassembly | `disasm`, `u` |
-| Memory | `memory read`, `memory range`, `memory buffer`, `memory dump`, `memory strings`, `memory dps`, `memory classify`, `memory chase`, `memory watchpoint`, `watchpoint` |
-| Object analysis | `object vtable` |
-
-Most commands accept `-s` as a short form for `--session` and `-c` as a short form for `--cursor`. Common command aliases include `caps`, `mods`, `active`, `regs`, `ctx`, and `cmdline`.
-
-`architecture state` reports the detected cursor architecture, whether x64 register context/disassembly helpers are supported, and explicit x86/ARM64 gaps so agents can avoid retrying architecture-specific commands blindly.
-
-`replay capabilities` reports which replay controls are currently real versus native bridge gaps. `replay to` wraps cursor position seeking with before/after output, and `replay watch-memory` is a semantic alias for memory watchpoint replay.
-
-`sweep watch-memory` repeats TTD memory watchpoint replay with `--max-hits`, advances one step after each hit, and stops on duplicate positions or no further hits. It is a bounded foreground sweep; daemon-owned background jobs with progress/cancel are still a future native/daemon layer.
-
-`timeline events --session <id>` merges exposed module, thread, exception, and keyframe metadata into a single sequence-sorted event stream. It also reports recording-client/custom-event/activity/island metadata as a native bridge gap when those payloads are not available.
-
-`recipes` is a local, daemon-free diagnostic advisor inspired by TimDbg workflows. It explains when to use logs, dumps, TTD, live debugging, remote debugging, symbol diagnostics, memory provenance, stack-corruption watchpoints, COM/vtable inspection, and safe injection analysis. `context snapshot` is the fastest agent entry point after a session is open: it gathers daemon state, sessions, selected trace/cursor details, capabilities, position, active threads, stack, architecture state, current disassembly, nearest-export fallback, timeline summary, and command-line information into one JSON object.
-
-`remote explain` compares DbgSrv process servers with NTSD/CDB `-server` sessions. Use `remote server-command` on the target side and `remote connect-command --server <host>` on the host side to generate copy-pasteable WinDbg command lines without confusing `-remote` and `-premote`.
-
-`live capabilities` reports the current live DbgEng surface and gaps. `live launch --command-line <cmd>` is a one-shot live primitive: it launches a process under DbgEng, waits for the initial debug event, reports execution status, then explicitly detaches or terminates according to `--end`.
-
-`breakpoint capabilities` and `datamodel capabilities` make the remaining live breakpoint manager and DbgEng data-model/TargetModel gaps explicit while pointing agents to the supported TTD watchpoint sweep and structured JSON discovery surfaces.
-
-`target capabilities` distinguishes implemented TTD trace sessions from one-shot live DbgEng, future persisted live sessions, dump sessions, and TargetModel support. Add `--session` and optionally `--cursor` to include selected TTD backend and architecture evidence.
-
-`symbols diagnose --session <id>` reports the current symbol path, image path, Microsoft public-symbol configuration, module-data availability, PE image identity, CodeView PDB identity, export summary, and source-fidelity gaps. Add `--name <module>` or `--address <addr>` to narrow the diagnosis to one module. `symbols inspect <path>` works without a daemon and prints PE timestamp/size/checksum plus expected image and PDB symbol-store keys. `symbols exports <path>` lists PE exports with optional filtering, and `symbols nearest --session <id> --cursor <id> --address <addr>` provides a low-fidelity nearest-export fallback for addresses in loaded modules when private PDB symbols are unavailable. `source resolve` uses trailing path-component matching to map recorded PDB source paths to local checkouts.
-
-`memory dump` wraps `memory read` with structured `db`, `dq`, ASCII, and UTF-16 views. `memory strings` extracts bounded ASCII/UTF-16 strings with `--min-len` and `--max-strings`, while `memory dps` prints pointer-sized rows with optional `--target-info` classification. `memory classify` adds agent-friendly interpretation for ASCII/UTF-16 strings, repeated fill bytes, entropy, qword values, plausible x64 pointers, and instruction-like prefixes. `memory chase` follows a bounded pointer chain from `base + --offset` at each hop, with explicit `--depth`, `--pointer-size`, and optional `--target-info` address classification.
-
-`disasm` uses the current cursor RIP by default, or `--address <addr>` when provided. It returns x64 instruction bytes, formatted Intel/NASM-style text, flow-control classification, memory operand metadata, and tags such as `call`, `return`, `jump`, `memory_access`, `stack_related`, `teb_tls_segment`, and `breakpoint`.
-
-`object vtable` is a read-only helper for COM/C++ object investigations: it reads the first pointer-sized field as a vtable pointer, dumps entries, and classifies each target address through the existing address/module context.
-
-`stack recover` scans stack memory for pointer-sized values that land in loaded modules, ranks them as possible return addresses, and can enrich each candidate through `address` classification with `--target-info`. `stack backtrace` combines the current program counter with recovered return-address candidates into a clearly marked heuristic frame list when a trusted unwind is unavailable.
-
-`module audit` is a read-only inventory helper for injection-like symptoms. It flags missing module paths, locally unavailable binaries, duplicate basenames loaded from different paths, network paths, temp/download paths, and user-writable locations as triage evidence without attempting code injection or process mutation. `module search-order <dll> --app-dir <dir>` models common DLL search-order candidates and highlights risky directories so an agent can reason about hijacking/search-order symptoms without changing registry or process state.
-
-Every MCP tool remains available through the generic escape hatch, which is useful for skills that already have a complete MCP argument object:
-
-```powershell
-target/debug/windbg-tool.exe tool ttd_trace_info --json '{ "session_id": 1 }'
-target/debug/windbg-tool.exe tool ttd_read_memory --json-file request.json
-```
-
-Set `WINDBG_TOOL_PIPE` or pass `--pipe \\.\pipe\windbg-tool-custom` to isolate concurrent workspaces. The legacy `TTD_MCP_PIPE` variable is also honored. The daemon is local-only and does not open a TCP port.
-
-## DbgEng Process Server
-
-`windbg-tool` can start the same kind of DbgEng user-mode process server as the standalone `dbgsrv`-style helper:
-
-```powershell
-target/debug/windbg-tool.exe dbgeng server --transport tcp:port=5005
-target/debug/windbg-tool.exe dbgsrv -t tcp:port=5005
-```
-
-The command uses DbgEng's `DebugCreate`, `StartProcessServerWide`, and `WaitForProcessServerEnd` APIs, then waits until the process server exits. Runtime DLLs come from the `Microsoft.Debugging.Platform.DbgEng` NuGet package restored by `cargo xtask deps` and staged in `target/dbgeng-runtime` or copied into `target/package`.
-
-## WinDbg Downloader And Launcher
-
-The WinDbg command group downloads the current WinDbg package from Microsoft's appinstaller endpoint, selects the host-architecture MSIX from the bundle, verifies the package signature, extracts it into a tool-managed per-user install directory, and can launch `DbgX.Shell.exe`:
-
-```powershell
-target/debug/windbg-tool.exe windbg status
-target/debug/windbg-tool.exe windbg install
-target/debug/windbg-tool.exe windbg update
-target/debug/windbg-tool.exe windbg path --raw --field dbgx_path
-target/debug/windbg-tool.exe windbg run -- -k
-```
-
-Use `--install-dir <path>` on any `windbg` subcommand for deterministic CI or agent workspaces. Output is JSON by default, so agent skills can use the normal `--compact`, `--field`, and `--raw` controls.
-
-## MCP Tools
-
-Tools are exposed through the normal MCP `tools/list` and `tools/call` flow. Tool results are returned as JSON text content. Tool failures are reported as MCP tool results with `isError: true`, so clients can distinguish tool errors from JSON-RPC protocol errors.
-
-Most replay operations use two handles:
-
-- `session_id`: returned by `ttd_load_trace`.
-- `cursor_id`: returned by `ttd_cursor_create`. A session may have multiple independent cursors.
-
-Positions are serialized as objects with decimal `sequence` and `steps` fields:
-
-```json
-{ "sequence": 3171775, "steps": 26 }
-```
-
-For `ttd_position_set`, the `position` argument may be one of:
-
-- A position object, such as `{ "sequence": 3171775, "steps": 26 }`.
-- A WinDbg-style hex string, such as `"3065BF:1A"`.
-- A percentage number from `0` to `100`, which is resolved against the trace lifetime by sequence.
-
-`ttd_position_set` also accepts optional `thread_unique_id`, using the TTD trace-wide unique thread id from `ttd_list_threads` or `ttd_active_threads`. When present, the native backend calls TTD `SetPositionOnThread` and moves to the closest valid position on that thread.
-
-### Session Tools
-
-| Tool | Arguments | Result |
-| --- | --- | --- |
-| `ttd_load_trace` | `trace_path`; optional `companion_path`, `trace_index`, `symbols` object | Opens a `.run`, `.idx`, or `.ttd` trace and returns `session_id`, trace metadata, trace file/session identifiers when available, the resolved `symbol_path`, and resolved symbol settings. If the native bridge or runtime DLLs are unavailable, it creates a placeholder session with a warning. |
-| `ttd_trace_list` | `trace_path`; optional `companion_path` | Enumerates traces inside a `.run`, `.idx`, or `.ttd` trace pack without opening a replay session. Returns trace count, selected file metadata, companion file metadata, trace indices, recording type, session GUID, and group GUID. Requires the native replay backend. |
-| `ttd_close_trace` | `session_id` | Closes the trace session and releases native replay resources. |
-| `ttd_trace_info` | `session_id` | Returns trace path, backend name, index status, process/PEB details when available, trace lifetime, architecture, and event/list counts. |
-| `ttd_index_status` | `session_id` | Returns the TTD index status for a loaded native replay session: `loaded`, `not_present`, `unloadable`, or `unknown`. |
-| `ttd_index_stats` | `session_id` | Returns global and segment memory index tree statistics plus index cache map/lock counters. Requires the native replay backend. |
-| `ttd_build_index` | `session_id`; optional `flags` array | Synchronously builds the trace index and returns final status plus keyframe progress. Supported flags are `delete-existing-unloadable`, `temporary`, `self-contained`, `all`, and `none`. Requires the native replay backend and may be expensive on large traces. |
-
-The optional `symbols` object accepted by `ttd_load_trace` has these fields:
-
-```json
-{
-  "binary_paths": ["traces/ping/ping.exe", "C:/Windows/System32"],
-  "symbol_paths": ["srv*C:/symbols*https://msdl.microsoft.com/download/symbols"],
-  "symcache_dir": ".ttd-symbol-cache"
-}
-```
-
-If `symbol_paths` is empty, `_NT_SYMBOL_PATH` is used when set. If the resulting symbol path does not already include the Microsoft public symbol server, the server appends `srv*<symcache_dir>*https://msdl.microsoft.com/download/symbols` automatically. `binary_paths` are joined into the native image path so replay and later symbol features can find binaries that match the trace.
-
-### Trace Metadata Tools
-
-| Tool | Arguments | Result |
-| --- | --- | --- |
-| `ttd_list_threads` | `session_id` | Lists trace threads with unique TTD thread id, OS thread id, lifetime positions, and active-time positions when available. Requires the native replay backend for non-empty results. |
-| `ttd_list_modules` | `session_id` | Lists module instances with name, path, base address, size, load position, and unload position when available. Requires the native replay backend for module data. |
-| `ttd_cursor_modules` | `session_id`, `cursor_id` | Lists module instances loaded at the cursor position with name, path, base address, size, and lifetime positions. Requires the native replay backend. |
-| `ttd_list_keyframes` | `session_id` | Lists replay keyframe positions captured in the trace. Requires the native replay backend for non-empty results. |
-| `ttd_module_events` | `session_id` | Lists module load and unload events with event position and module identity. Requires the native replay backend for non-empty results. |
-| `ttd_thread_events` | `session_id` | Lists thread create and terminate events with event position and thread identity/lifetime data. Requires the native replay backend for non-empty results. |
-| `ttd_list_exceptions` | `session_id` | Lists exception events with position, thread unique id, exception code/flags, program counter, record address, and parameters. Requires the native replay backend for non-empty results. |
-
-### Cursor And Navigation Tools
-
-| Tool | Arguments | Result |
-| --- | --- | --- |
-| `ttd_cursor_create` | `session_id` | Creates an independent replay cursor and returns `cursor_id` plus its starting position. |
-| `ttd_position_get` | `session_id`, `cursor_id` | Returns the current cursor position. |
-| `ttd_position_set` | `session_id`, `cursor_id`, `position`; optional `thread_unique_id` | Moves the cursor to a position object, `HEX:HEX` string, or approximate lifetime percentage. With `thread_unique_id`, moves to the closest valid position on that TTD thread. |
-| `ttd_step` | `session_id`, `cursor_id`; optional `direction`, `kind`, `count` | Replays the cursor forward or backward and returns the new position, previous position, requested count, executed step/instruction counts, and stop reason. Requires the native replay backend. |
-| `ttd_active_threads` | `session_id`, `cursor_id` | Lists threads active at the cursor position with per-thread positions, PC/SP/FP/TEB state, and module/RVA coordinates for each runtime PC when available. Requires the native replay backend. |
-
-`ttd_step` defaults to:
-
-```json
-{
-  "direction": "forward",
-  "kind": "step",
-  "count": 1
-}
-```
-
-`direction` may be `"forward"` or `"backward"`. `kind` may be `"step"` or `"trace"`; `step` currently uses TTD replay's current-thread flag, while `trace` allows replay across the normal trace execution flow. `count` must be between `1` and `10000`.
-
-### State And Memory Tools
-
-| Tool | Arguments | Result |
-| --- | --- | --- |
-| `ttd_registers` | `session_id`, `cursor_id` | Returns compact cursor state: position, previous position, current thread ids, TEB address, program counter, stack pointer, frame pointer, and basic return value. Requires the native replay backend. |
-| `ttd_register_context` | `session_id`, `cursor_id`; optional `thread_id` | Returns x64 register context from TTD `GetCrossPlatformContext` and `GetAvxExtendedContext`, including control, segment, debug, general-purpose, XMM/YMM vector registers, branch/exception RIP fields, current thread identity, TEB, and module/RVA coordinates for RIP. Requires the native replay backend. |
-| `ttd_command_line` | `session_id`, `cursor_id` | Reads the process command line by following the PEB process-parameters pointers at the cursor position. Requires x64 PEB layout assumptions and the native replay backend. |
-| `ttd_read_memory` | `session_id`, `cursor_id`, `address`, `size`; optional `policy` | Reads guest memory at the cursor position and returns the requested address/size, actual address, byte count, completeness flag, selected query policy, and lowercase hex data. Requires the native replay backend. |
-| `ttd_memory_range` | `session_id`, `cursor_id`, `address`; optional `max_bytes`, `policy` | Queries the trace-backed contiguous memory range containing or following a guest address, returning the range address, source sequence, available byte count, selected query policy, bounded hex bytes, and module/RVA coordinates when available. Requires the native replay backend. |
-| `ttd_memory_buffer` | `session_id`, `cursor_id`, `address`, `size`; optional `max_ranges`, `policy` | Reads guest memory at the cursor position and returns lowercase hex data plus the selected query policy, per-subrange source sequences, buffer offsets, and module/RVA coordinates for correlating runtime bytes with static analysis tools. Requires the native replay backend. |
-| `ttd_memory_watchpoint` | `session_id`, `cursor_id`, `address`, `size`, `access`, `direction` | Finds the previous or next read/write/execute access to a guest memory range, moves the cursor to the replay stop position, and returns hit details when found. Requires the native replay backend. |
-
-`ttd_register_context` defaults to the cursor's current thread; pass an active OS `thread_id` from `ttd_active_threads` to inspect another live thread at the same cursor position. XMM values are 16-byte little-endian hex strings, and YMM values are reconstructed as 32-byte little-endian hex strings from the lower XMM state plus the AVX high half. Cursor-aware tools such as `ttd_address_info`, `ttd_active_threads`, `ttd_register_context`, `ttd_memory_range`, and `ttd_memory_buffer` use `ttd_cursor_modules` internally for module/RVA coordinates so unloaded modules from other trace positions do not shadow the current runtime state. `ttd_read_memory`, `ttd_memory_range`, and `ttd_memory_buffer` accept `policy` values `"default"`, `"thread_local"`, `"globally_conservative"`, `"globally_aggressive"`, and `"in_fragment_aggressive"`, matching TTD `QueryMemoryPolicy`; responses echo the policy used. `ttd_read_memory` and `ttd_memory_buffer` require `address` to be non-zero and `size` to be between `1` and `65536` bytes. `ttd_memory_buffer` defaults to `64` source ranges and accepts up to `1024`. `ttd_memory_range` requires `address` to be non-zero and limits `max_bytes` to `65536`; set `max_bytes` to `0` to request provenance without returning bytes. `ttd_memory_watchpoint` requires a non-zero `address` and non-zero `size`, accepts `direction` values `"previous"` or `"next"`, and accepts an optional `thread_unique_id` filter. Its `access` values cover TTD `DataAccessMask`: `"read"`, `"write"`, `"execute"`, `"code_fetch"`, `"overwrite"`, `"data_mismatch"`, `"new_data"`, `"redundant_data"`, `"read_write"`, and `"all"`. A successful watchpoint response with `"found": false` means replay reached a trace boundary or other stop before a matching access; it is not a tool error.
-
-### Example Tool Calls
-
-Load a trace with a matching binary next to it:
-
-```json
-{
-  "name": "ttd_load_trace",
-  "arguments": {
-    "trace_path": "traces/ping/ping01.run",
-    "symbols": {
-      "binary_paths": ["traces/ping/ping.exe"]
-    }
-  }
-}
-```
-
-Create a cursor, move near the middle of the trace, and step one instruction on the current thread:
-
-```json
-{ "name": "ttd_cursor_create", "arguments": { "session_id": 1 } }
-{ "name": "ttd_position_set", "arguments": { "session_id": 1, "cursor_id": 1, "position": 50 } }
-{ "name": "ttd_step", "arguments": { "session_id": 1, "cursor_id": 1, "direction": "forward", "kind": "step", "count": 1 } }
-```
-
-Read 64 bytes from the PEB address reported by `ttd_trace_info`:
-
-```json
-{
-  "name": "ttd_read_memory",
-  "arguments": {
-    "session_id": 1,
-    "cursor_id": 1,
-    "address": 140703128616960,
-    "size": 64
-  }
-}
-```
-
-Search backward for a read of a known memory range:
-
-```json
-{
-  "name": "ttd_memory_watchpoint",
-  "arguments": {
-    "session_id": 1,
-    "cursor_id": 1,
-    "address": 140703128616960,
-    "size": 16,
-    "access": "read",
-    "direction": "previous"
-  }
-}
-```
-
-## Sample Ping Trace Prompts
-
-Once the sample fixture is extracted, an MCP client can use the local trace and matching binary:
+Helpful starting prompt:
 
 ```text
-traces/ping/ping01.run
-traces/ping/ping.exe
+Use the windbg-ttd server to load C:\path\to\trace.run with the matching binary path, create a cursor, summarize the trace, and show the current compact register state.
 ```
 
-These prompts are written for an assistant that has this MCP server configured as `windbg-ttd`. They intentionally ask for raw trace facts, modules, positions, registers, memory, command-line data, and memory watchpoint replay, which are supported today. Full symbol lookup, source lookup, and stack unwinding are planned but not implemented yet.
+For configuration details, session/cursor concepts, symbol settings, and example tool calls/prompts, see [the MCP guide](docs/mcp.md).
 
-### Load And Summarize
+## More docs
 
-```text
-Use the windbg-ttd server to load traces/ping/ping01.run with traces/ping/ping.exe as the matching binary path. Summarize the trace backend, process id, lifetime start/end positions, thread count, module count, exception count, and whether native replay is active.
-```
+- [CLI guide](docs/cli.md) - daemon model, CLI workflows, and command groups
+- [MCP guide](docs/mcp.md) - MCP configuration, core tool flow, and example prompts
+- [Development guide](docs/development.md) - build, native dependencies, symbols, tests, and repository hygiene
+- [Architecture notes](docs/architecture.md) - architecture and layering details
 
-Expected tool flow: `ttd_load_trace`, then `ttd_trace_info`.
+## Trace privacy
 
-### Confirm The Recorded Command
-
-```text
-Load the sample ping TTD trace, create a replay cursor, and read the recorded process command line. Tell me exactly what ping.exe command was captured.
-```
-
-Expected tool flow: `ttd_load_trace`, `ttd_cursor_create`, then `ttd_command_line`.
-
-### Inspect Loaded Modules
-
-```text
-Open traces/ping/ping01.run with traces/ping/ping.exe as the binary path, list the captured modules, and tell me whether ping.exe appears in the module list. Include its base address, size, load position, and path if available.
-```
-
-Expected tool flow: `ttd_load_trace`, then `ttd_list_modules`.
-
-### Check Threads And Exceptions
-
-```text
-Use the ping trace to list all captured threads and exceptions. Summarize the OS thread ids, lifetime ranges, active ranges, exception codes, exception positions, and program counters. If there are no exceptions, say that directly.
-```
-
-Expected tool flow: `ttd_load_trace`, `ttd_list_threads`, then `ttd_list_exceptions`.
-
-### Seek And Step
-
-```text
-Load the sample ping trace, create a cursor, move it to 50 percent through the trace, show the current position and compact register state, then step forward one current-thread step. Report the old position, new position, stop reason, program counter, stack pointer, and current thread id.
-```
-
-Expected tool flow: `ttd_load_trace`, `ttd_cursor_create`, `ttd_position_set`, `ttd_registers`, `ttd_step`, then `ttd_registers` again.
-
-### Compare Start, Middle, And End State
-
-```text
-For traces/ping/ping01.run, create one cursor and compare compact register state at 0 percent, 50 percent, and 100 percent through the trace. For each point, include the resolved position, thread id, program counter, stack pointer, frame pointer, and TEB address.
-```
-
-Expected tool flow: `ttd_load_trace`, `ttd_cursor_create`, repeated `ttd_position_set` and `ttd_registers` calls.
-
-### Read Process Memory Near The PEB
-
-```text
-Load the sample ping trace and read trace info to find the PEB address. Create a cursor, then read 64 bytes at the PEB address. Show the address actually read, byte count, completeness flag, and the hex bytes. Do not interpret fields beyond what the current tools can prove.
-```
-
-Expected tool flow: `ttd_load_trace`, `ttd_trace_info`, `ttd_cursor_create`, then `ttd_read_memory`.
-
-### Find A Previous Command-Line Buffer Read
-
-```text
-Load the sample ping trace, create a cursor, read the recorded process command line, move the cursor to the end of the trace, then search backward for a read of the command-line buffer address. Report whether a hit was found, the stop position, matched address and size, matched access type, program counter, and current thread id.
-```
-
-Expected tool flow: `ttd_load_trace`, `ttd_cursor_create`, `ttd_command_line`, `ttd_position_set`, then `ttd_memory_watchpoint`.
-
-### Build A Compact Trace Inventory
-
-```text
-Use windbg-ttd to build a compact inventory of the ping TTD trace: trace metadata, command line, thread count with thread ids, module count with the first 10 module names, exception count, and current cursor register state at the trace midpoint.
-```
-
-Expected tool flow: `ttd_load_trace`, `ttd_trace_info`, `ttd_cursor_create`, `ttd_command_line`, `ttd_list_threads`, `ttd_list_modules`, `ttd_list_exceptions`, `ttd_position_set`, and `ttd_registers`.
-
-### Validate Native Replay Availability
-
-```text
-Load traces/ping/ping01.run through windbg-ttd and check whether the backend is ttd-replay-native. If it is not native, explain the warning from the trace info and stop before asking for registers, memory, command-line, or stepping.
-```
-
-Expected tool flow: `ttd_load_trace`, then `ttd_trace_info`.
-
-## Trace Privacy
-
-TTD trace files can contain memory, file paths, registry data, and other sensitive process state from the recorded machine. Treat `.run` and `.idx` files as sensitive artifacts and avoid committing them.
-
-## Local Ping Trace Tests
-
-The committed sample fixture is `traces/ping.7z`. The extracted `traces/ping` directory is ignored by git because it contains large and sensitive replay artifacts. The integration tests automatically extract the archive into `traces/` when the extracted fixture is missing and `7z` or `7zz` is available on `PATH`. If 7-Zip is installed somewhere else, set `TTD_TEST_7Z` to the executable path.
-
-After extraction, the fixture layout is:
-
-```text
-traces/ping/ping01.run
-traces/ping/ping01.idx
-traces/ping/ping.exe
-```
-
-The extracted artifacts are local-only and ignored by git. The Rust integration tests skip cleanly when neither the extracted fixture nor a usable archive extractor is available. Run strict local replay checks with:
-
-```powershell
-$env:TTD_RUNTIME_DIR = "D:\dev\windbg-tool\target\ttd-runtime"
-$env:TTD_MCP_EXPECT_NATIVE_REPLAY = "1"
-cargo test -p windbg-ttd --test ping_trace
-cargo test -p windbg-tool --test daemon_cli
-```
-
-To force a custom trace instead of the committed archive fixture, set `TTD_TEST_TRACE` to a `.run` file path.
+TTD traces can contain process memory, file paths, registry data, and other sensitive machine state. Treat `.run`, `.idx`, and related replay artifacts as sensitive local files.

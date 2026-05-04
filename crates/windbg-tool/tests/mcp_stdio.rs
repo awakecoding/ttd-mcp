@@ -981,6 +981,36 @@ fn required_args_for_tool(name: &str) -> anyhow::Result<&'static [&'static str]>
         "ttd_read_memory" => Ok(&["session_id", "cursor_id", "address", "size"]),
         "ttd_memory_range" => Ok(&["session_id", "cursor_id", "address"]),
         "ttd_memory_buffer" => Ok(&["session_id", "cursor_id", "address", "size"]),
+        "live_launch_session" => Ok(&["command_line"]),
+        "live_attach_process" => Ok(&["process_id"]),
+        "dump_open_session" => Ok(&["path"]),
+        "target_status"
+        | "target_close"
+        | "target_terminate"
+        | "target_continue"
+        | "target_step_into"
+        | "target_core_registers"
+        | "target_list_threads"
+        | "target_list_modules"
+        | "target_list_breakpoints" => Ok(&["target_id"]),
+        "target_wait" => Ok(&["target_id"]),
+        "target_read_memory" => Ok(&["target_id", "address", "size"]),
+        "target_symbol_by_offset" | "target_source_by_offset" => Ok(&["target_id", "address"]),
+        "target_stack_trace" => Ok(&["target_id"]),
+        "target_disassemble" => Ok(&["target_id"]),
+        "target_set_breakpoint" => Ok(&["target_id", "address"]),
+        "target_remove_breakpoint" => Ok(&["target_id", "breakpoint_id"]),
+        "target_evaluate_expression" => Ok(&["target_id", "expression"]),
+        "job_start_watch_memory_sweep" => Ok(&[
+            "session_id",
+            "cursor_id",
+            "address",
+            "size",
+            "access",
+            "direction",
+        ]),
+        "job_list" => Ok(&[]),
+        "job_status" | "job_result" | "job_cancel" => Ok(&["job_id"]),
         "ttd_memory_watchpoint" => Ok(&[
             "session_id",
             "cursor_id",
@@ -989,6 +1019,7 @@ fn required_args_for_tool(name: &str) -> anyhow::Result<&'static [&'static str]>
             "access",
             "direction",
         ]),
+        "target_list" => Ok(&[]),
         _ => bail!("unexpected tool listed by server: {name}"),
     }
 }

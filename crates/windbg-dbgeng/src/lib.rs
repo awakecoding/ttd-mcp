@@ -1,4 +1,6 @@
+use anyhow::Context;
 use serde::Serialize;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct ProcessServerOptions {
@@ -18,11 +20,35 @@ pub struct LiveLaunchOptions {
     pub end: LiveLaunchEnd,
 }
 
+#[derive(Debug, Clone)]
+pub struct LiveLaunchSessionOptions {
+    pub command_line: String,
+    pub initial_break_timeout_ms: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveAttachOptions {
+    pub process_id: u32,
+    pub initial_break_timeout_ms: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct DumpOpenOptions {
+    pub path: PathBuf,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LiveLaunchEnd {
     Detach,
     Terminate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DebuggerSessionKind {
+    Live,
+    Dump,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -35,12 +61,733 @@ pub struct LiveLaunchResult {
     pub end: LiveLaunchEnd,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DebuggerExecutionStatus {
+    pub raw: Option<u32>,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DebuggerSessionSummary {
+    pub kind: DebuggerSessionKind,
+    pub target: String,
+    pub process_id: Option<u32>,
+    pub dump_path: Option<PathBuf>,
+    pub processor_type: Option<u32>,
+    pub processor_name: Option<String>,
+    pub execution_status: DebuggerExecutionStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CoreRegisterState {
+    pub thread_system_id: Option<u32>,
+    pub instruction_offset: Option<u64>,
+    pub stack_offset: Option<u64>,
+    pub frame_offset: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryReadResult {
+    pub address: u64,
+    pub requested_size: u32,
+    pub bytes_read: u32,
+    pub complete: bool,
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ThreadInfo {
+    pub engine_id: u32,
+    pub system_id: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModuleInfo {
+    pub base_address: u64,
+    pub module_name: Option<String>,
+    pub image_name: Option<String>,
+    pub loaded_image_name: Option<String>,
+    pub symbol_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolInfo {
+    pub address: u64,
+    pub name: String,
+    pub displacement: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceLocation {
+    pub address: u64,
+    pub file: String,
+    pub line: u32,
+    pub displacement: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StackFrameInfo {
+    pub instruction_offset: u64,
+    pub return_offset: u64,
+    pub frame_offset: u64,
+    pub stack_offset: u64,
+    pub frame_number: u32,
+    pub inline_frame: bool,
+    pub params: [u64; 4],
+    pub symbol: Option<SymbolInfo>,
+    pub source: Option<SourceLocation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DisassemblyLine {
+    pub address: u64,
+    pub next_address: u64,
+    pub text: String,
+    pub symbol: Option<SymbolInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DisassemblyResult {
+    pub start_address: u64,
+    pub lines: Vec<DisassemblyLine>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BreakpointInfo {
+    pub id: u32,
+    pub offset: u64,
+    pub break_type: u32,
+    pub flags: u32,
+    pub enabled: bool,
+    pub data_size: u32,
+    pub data_access_type: u32,
+    pub match_thread: Option<u32>,
+    pub command: Option<String>,
+    pub offset_expression: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EvaluationResult {
+    pub expression: String,
+    pub value_type: u32,
+    pub value_type_name: String,
+    pub unsigned_value: Option<u64>,
+    pub signed_value: Option<i64>,
+    pub float64_value: Option<f64>,
+}
+
 pub fn start_process_server(options: ProcessServerOptions) -> anyhow::Result<ProcessServerResult> {
     start_process_server_impl(options)
 }
 
 pub fn live_launch_initial_break(options: LiveLaunchOptions) -> anyhow::Result<LiveLaunchResult> {
     live_launch_initial_break_impl(options)
+}
+
+pub fn launch_live_session(options: LiveLaunchSessionOptions) -> anyhow::Result<DebuggerSession> {
+    launch_live_session_impl(options)
+}
+
+pub fn attach_live_session(options: LiveAttachOptions) -> anyhow::Result<DebuggerSession> {
+    attach_live_session_impl(options)
+}
+
+pub fn open_dump_session(options: DumpOpenOptions) -> anyhow::Result<DebuggerSession> {
+    open_dump_session_impl(options)
+}
+
+#[cfg(windows)]
+pub struct DebuggerSession {
+    kind: DebuggerSessionKind,
+    target: String,
+    process_id: Option<u32>,
+    dump_path: Option<PathBuf>,
+    client: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugClient5,
+    control: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugControl5,
+    data_spaces: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugDataSpaces4,
+    registers: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugRegisters,
+    symbols: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSymbols5,
+    system_objects: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSystemObjects,
+}
+
+#[cfg(windows)]
+unsafe impl Send for DebuggerSession {}
+
+#[cfg(not(windows))]
+pub struct DebuggerSession;
+
+#[cfg(windows)]
+impl DebuggerSession {
+    pub fn summary(&self) -> DebuggerSessionSummary {
+        DebuggerSessionSummary {
+            kind: self.kind,
+            target: self.target.clone(),
+            process_id: self.current_process_system_id().ok().or(self.process_id),
+            dump_path: self.dump_path.clone(),
+            processor_type: self.processor_type().ok(),
+            processor_name: self.processor_name().ok(),
+            execution_status: self.execution_status(),
+        }
+    }
+
+    pub fn kind(&self) -> DebuggerSessionKind {
+        self.kind
+    }
+
+    pub fn execution_status(&self) -> DebuggerExecutionStatus {
+        let raw = unsafe { self.control.GetExecutionStatus().ok() };
+        DebuggerExecutionStatus {
+            raw,
+            name: raw.map(status_name),
+        }
+    }
+
+    pub fn wait_for_event(&self, timeout_ms: u32) -> anyhow::Result<DebuggerExecutionStatus> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_WAIT_DEFAULT;
+
+        unsafe { self.control.WaitForEvent(DEBUG_WAIT_DEFAULT, timeout_ms)? };
+        Ok(self.execution_status())
+    }
+
+    pub fn continue_execution(&self) -> anyhow::Result<DebuggerExecutionStatus> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_STATUS_GO;
+
+        unsafe {
+            self.control.SetExecutionStatus(DEBUG_STATUS_GO)?;
+        }
+        Ok(self.execution_status())
+    }
+
+    pub fn step_into(&self) -> anyhow::Result<DebuggerExecutionStatus> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_STATUS_STEP_INTO;
+
+        unsafe {
+            self.control.SetExecutionStatus(DEBUG_STATUS_STEP_INTO)?;
+        }
+        Ok(self.execution_status())
+    }
+
+    pub fn detach(&self) -> anyhow::Result<()> {
+        unsafe {
+            self.client.DetachProcesses()?;
+        }
+        Ok(())
+    }
+
+    pub fn terminate(&self) -> anyhow::Result<()> {
+        unsafe {
+            self.client.TerminateProcesses()?;
+        }
+        Ok(())
+    }
+
+    pub fn core_registers(&self) -> anyhow::Result<CoreRegisterState> {
+        let instruction_offset = unsafe { self.registers.GetInstructionOffset().ok() };
+        let stack_offset = unsafe { self.registers.GetStackOffset().ok() };
+        let frame_offset = unsafe { self.registers.GetFrameOffset().ok() };
+
+        Ok(CoreRegisterState {
+            thread_system_id: self.current_thread_system_id().ok(),
+            instruction_offset,
+            stack_offset,
+            frame_offset,
+        })
+    }
+
+    pub fn read_memory(&self, address: u64, size: u32) -> anyhow::Result<MemoryReadResult> {
+        let mut buffer = vec![0u8; size as usize];
+        let mut bytes_read = 0u32;
+        unsafe {
+            self.data_spaces.ReadVirtual(
+                address,
+                buffer.as_mut_ptr() as _,
+                size,
+                Some(&mut bytes_read),
+            )?;
+        }
+        buffer.truncate(bytes_read as usize);
+        Ok(MemoryReadResult {
+            address,
+            requested_size: size,
+            bytes_read,
+            complete: bytes_read == size,
+            data: encode_hex(&buffer),
+        })
+    }
+
+    pub fn threads(&self) -> anyhow::Result<Vec<ThreadInfo>> {
+        let count = unsafe { self.system_objects.GetNumberThreads()? };
+        let mut engine_ids = vec![0u32; count as usize];
+        let mut system_ids = vec![0u32; count as usize];
+        unsafe {
+            self.system_objects.GetThreadIdsByIndex(
+                0,
+                count,
+                Some(engine_ids.as_mut_ptr()),
+                Some(system_ids.as_mut_ptr()),
+            )?;
+        }
+        Ok(engine_ids
+            .into_iter()
+            .zip(system_ids)
+            .map(|(engine_id, system_id)| ThreadInfo {
+                engine_id,
+                system_id,
+            })
+            .collect())
+    }
+
+    pub fn modules(&self) -> anyhow::Result<Vec<ModuleInfo>> {
+        let mut loaded = 0u32;
+        let mut unloaded = 0u32;
+        unsafe {
+            self.symbols.GetNumberModules(&mut loaded, &mut unloaded)?;
+        }
+        let mut modules = Vec::with_capacity(loaded as usize);
+        for index in 0..loaded {
+            let base_address = unsafe { self.symbols.GetModuleByIndex(index)? };
+            modules.push(ModuleInfo {
+                base_address,
+                module_name: self.module_name_string(
+                    windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_MODNAME_MODULE,
+                    index,
+                    base_address,
+                ),
+                image_name: self.module_name_string(
+                    windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_MODNAME_IMAGE,
+                    index,
+                    base_address,
+                ),
+                loaded_image_name: self.module_name_string(
+                    windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_MODNAME_LOADED_IMAGE,
+                    index,
+                    base_address,
+                ),
+                symbol_file: self.module_name_string(
+                    windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_MODNAME_SYMBOL_FILE,
+                    index,
+                    base_address,
+                ),
+            });
+        }
+        Ok(modules)
+    }
+
+    pub fn symbol_by_offset(&self, address: u64) -> anyhow::Result<Option<SymbolInfo>> {
+        self.try_symbol_by_offset(address)
+    }
+
+    pub fn source_by_offset(&self, address: u64) -> anyhow::Result<Option<SourceLocation>> {
+        let mut line = 0u32;
+        let mut displacement = 0u64;
+        let file = match read_wide_string(|buffer, size| unsafe {
+            self.symbols.GetLineByOffsetWide(
+                address,
+                Some(&mut line),
+                Some(buffer),
+                size,
+                Some(&mut displacement),
+            )
+        }) {
+            Ok(value) => value,
+            Err(_) => return Ok(None),
+        };
+        Ok(Some(SourceLocation {
+            address,
+            file,
+            line,
+            displacement,
+        }))
+    }
+
+    pub fn stack_trace(&self, max_frames: u32) -> anyhow::Result<Vec<StackFrameInfo>> {
+        let registers = self.core_registers()?;
+        let frame_offset = registers.frame_offset.unwrap_or(0);
+        let stack_offset = registers.stack_offset.unwrap_or(0);
+        let instruction_offset = registers.instruction_offset.unwrap_or(0);
+        let mut frames = vec![
+            windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_STACK_FRAME::default();
+            max_frames as usize
+        ];
+        let mut filled = 0u32;
+        unsafe {
+            self.control.GetStackTrace(
+                frame_offset,
+                stack_offset,
+                instruction_offset,
+                &mut frames,
+                Some(&mut filled),
+            )?;
+        }
+        frames.truncate(filled as usize);
+        Ok(frames
+            .into_iter()
+            .map(|frame| StackFrameInfo {
+                instruction_offset: frame.InstructionOffset,
+                return_offset: frame.ReturnOffset,
+                frame_offset: frame.FrameOffset,
+                stack_offset: frame.StackOffset,
+                frame_number: frame.FrameNumber,
+                inline_frame: frame.Virtual.as_bool(),
+                params: frame.Params,
+                symbol: self
+                    .try_symbol_by_offset(frame.InstructionOffset)
+                    .ok()
+                    .flatten(),
+                source: self
+                    .source_by_offset(frame.InstructionOffset)
+                    .ok()
+                    .flatten(),
+            })
+            .collect())
+    }
+
+    pub fn disassemble(
+        &self,
+        address: Option<u64>,
+        count: u32,
+    ) -> anyhow::Result<DisassemblyResult> {
+        let start_address = match address {
+            Some(value) => value,
+            None => self
+                .core_registers()?
+                .instruction_offset
+                .context("no current instruction offset is available for this target")?,
+        };
+        let mut next_address = start_address;
+        let mut lines = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let mut end_offset = 0u64;
+            let text = read_wide_string(|buffer, size| unsafe {
+                self.control
+                    .DisassembleWide(next_address, 0, Some(buffer), size, &mut end_offset)
+            })?;
+            lines.push(DisassemblyLine {
+                address: next_address,
+                next_address: end_offset,
+                text: text.trim().to_string(),
+                symbol: self.try_symbol_by_offset(next_address).ok().flatten(),
+            });
+            if end_offset == next_address {
+                break;
+            }
+            next_address = end_offset;
+        }
+        Ok(DisassemblyResult {
+            start_address,
+            lines,
+        })
+    }
+
+    pub fn list_breakpoints(&self) -> anyhow::Result<Vec<BreakpointInfo>> {
+        let count = unsafe { self.control.GetNumberBreakpoints()? };
+        let mut breakpoints = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let breakpoint = unsafe { self.control.GetBreakpointByIndex2(index)? };
+            breakpoints.push(self.breakpoint_info(&breakpoint)?);
+        }
+        Ok(breakpoints)
+    }
+
+    pub fn add_code_breakpoint(&self, address: u64) -> anyhow::Result<BreakpointInfo> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            DEBUG_ANY_ID, DEBUG_BREAKPOINT_CODE, DEBUG_BREAKPOINT_ENABLED,
+        };
+
+        let breakpoint = unsafe {
+            self.control
+                .AddBreakpoint2(DEBUG_BREAKPOINT_CODE, DEBUG_ANY_ID)?
+        };
+        unsafe {
+            breakpoint.SetOffset(address)?;
+            breakpoint.AddFlags(DEBUG_BREAKPOINT_ENABLED)?;
+        }
+        self.breakpoint_info(&breakpoint)
+    }
+
+    pub fn add_data_breakpoint(
+        &self,
+        address: u64,
+        size: u32,
+        access_type: u32,
+    ) -> anyhow::Result<BreakpointInfo> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            DEBUG_ANY_ID, DEBUG_BREAKPOINT_DATA, DEBUG_BREAKPOINT_ENABLED,
+        };
+
+        let breakpoint = unsafe {
+            self.control
+                .AddBreakpoint2(DEBUG_BREAKPOINT_DATA, DEBUG_ANY_ID)?
+        };
+        unsafe {
+            breakpoint.SetOffset(address)?;
+            breakpoint.SetDataParameters(size, access_type)?;
+            breakpoint.AddFlags(DEBUG_BREAKPOINT_ENABLED)?;
+        }
+        self.breakpoint_info(&breakpoint)
+    }
+
+    pub fn remove_breakpoint(&self, breakpoint_id: u32) -> anyhow::Result<()> {
+        let breakpoint = unsafe { self.control.GetBreakpointById2(breakpoint_id)? };
+        unsafe {
+            self.control.RemoveBreakpoint2(&breakpoint)?;
+        }
+        Ok(())
+    }
+
+    pub fn evaluate(&self, expression: &str) -> anyhow::Result<EvaluationResult> {
+        use windows::core::PCWSTR;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            DEBUG_VALUE_FLOAT64, DEBUG_VALUE_INT64,
+        };
+
+        let mut value =
+            windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_VALUE::default();
+        let mut expression_wide = expression.encode_utf16().collect::<Vec<_>>();
+        expression_wide.push(0);
+        unsafe {
+            self.control.EvaluateWide(
+                PCWSTR(expression_wide.as_ptr()),
+                DEBUG_VALUE_INT64,
+                &mut value,
+                None,
+            )?;
+        }
+        let (unsigned_value, signed_value, float64_value) = unsafe {
+            match value.Type {
+                DEBUG_VALUE_INT64 => {
+                    let raw = value.Anonymous.Anonymous.I64;
+                    (Some(raw), Some(raw as i64), None)
+                }
+                DEBUG_VALUE_FLOAT64 => (None, None, Some(value.Anonymous.F64)),
+                _ => (None, None, None),
+            }
+        };
+        Ok(EvaluationResult {
+            expression: expression.to_string(),
+            value_type: value.Type,
+            value_type_name: debug_value_type_name(value.Type).to_string(),
+            unsigned_value,
+            signed_value,
+            float64_value,
+        })
+    }
+
+    fn current_process_system_id(&self) -> anyhow::Result<u32> {
+        Ok(unsafe { self.system_objects.GetCurrentProcessSystemId()? })
+    }
+
+    fn current_thread_system_id(&self) -> anyhow::Result<u32> {
+        Ok(unsafe { self.system_objects.GetCurrentThreadSystemId()? })
+    }
+
+    fn processor_type(&self) -> anyhow::Result<u32> {
+        Ok(unsafe { self.control.GetActualProcessorType()? })
+    }
+
+    fn processor_name(&self) -> anyhow::Result<String> {
+        let processor_type = self.processor_type()?;
+        read_wide_string(|buffer, size| unsafe {
+            self.control
+                .GetProcessorTypeNamesWide(processor_type, None, None, Some(buffer), size)
+        })
+    }
+
+    fn module_name_string(&self, which: u32, index: u32, base_address: u64) -> Option<String> {
+        read_wide_string(|buffer, size| unsafe {
+            self.symbols
+                .GetModuleNameStringWide(which, index, base_address, Some(buffer), size)
+        })
+        .ok()
+    }
+
+    fn try_symbol_by_offset(&self, address: u64) -> anyhow::Result<Option<SymbolInfo>> {
+        let mut displacement = 0u64;
+        let name = match read_wide_string(|buffer, size| unsafe {
+            self.symbols
+                .GetNameByOffsetWide(address, Some(buffer), size, Some(&mut displacement))
+        }) {
+            Ok(value) => value,
+            Err(_) => return Ok(None),
+        };
+        Ok(Some(SymbolInfo {
+            address,
+            name,
+            displacement,
+        }))
+    }
+
+    fn breakpoint_info(
+        &self,
+        breakpoint: &windows::Win32::System::Diagnostics::Debug::Extensions::IDebugBreakpoint2,
+    ) -> anyhow::Result<BreakpointInfo> {
+        let mut parameters =
+            windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_BREAKPOINT_PARAMETERS::default();
+        unsafe {
+            breakpoint.GetParameters(&mut parameters)?;
+        }
+        Ok(BreakpointInfo {
+            id: parameters.Id,
+            offset: unsafe { breakpoint.GetOffset().unwrap_or(parameters.Offset) },
+            break_type: parameters.BreakType,
+            flags: parameters.Flags,
+            enabled: parameters.Flags
+                & windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_BREAKPOINT_ENABLED
+                != 0,
+            data_size: parameters.DataSize,
+            data_access_type: parameters.DataAccessType,
+            match_thread: (parameters.MatchThread
+                != windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_ANY_ID)
+                .then_some(parameters.MatchThread),
+            command: read_wide_string(|buffer, size| unsafe {
+                breakpoint.GetCommandWide(Some(buffer), size)
+            })
+            .ok(),
+            offset_expression: read_wide_string(|buffer, size| unsafe {
+                breakpoint.GetOffsetExpressionWide(Some(buffer), size)
+            })
+            .ok(),
+        })
+    }
+}
+
+#[cfg(not(windows))]
+impl DebuggerSession {
+    pub fn summary(&self) -> DebuggerSessionSummary {
+        DebuggerSessionSummary {
+            kind: DebuggerSessionKind::Live,
+            target: "unsupported".to_string(),
+            process_id: None,
+            dump_path: None,
+            processor_type: None,
+            processor_name: None,
+            execution_status: DebuggerExecutionStatus {
+                raw: None,
+                name: None,
+            },
+        }
+    }
+
+    pub fn kind(&self) -> DebuggerSessionKind {
+        DebuggerSessionKind::Live
+    }
+
+    pub fn execution_status(&self) -> DebuggerExecutionStatus {
+        DebuggerExecutionStatus {
+            raw: None,
+            name: None,
+        }
+    }
+
+    pub fn wait_for_event(&self, _timeout_ms: u32) -> anyhow::Result<DebuggerExecutionStatus> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn continue_execution(&self) -> anyhow::Result<DebuggerExecutionStatus> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn step_into(&self) -> anyhow::Result<DebuggerExecutionStatus> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn detach(&self) -> anyhow::Result<()> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn terminate(&self) -> anyhow::Result<()> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn core_registers(&self) -> anyhow::Result<CoreRegisterState> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn read_memory(&self, _address: u64, _size: u32) -> anyhow::Result<MemoryReadResult> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn threads(&self) -> anyhow::Result<Vec<ThreadInfo>> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn modules(&self) -> anyhow::Result<Vec<ModuleInfo>> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn symbol_by_offset(&self, _address: u64) -> anyhow::Result<Option<SymbolInfo>> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn source_by_offset(&self, _address: u64) -> anyhow::Result<Option<SourceLocation>> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn stack_trace(&self, _max_frames: u32) -> anyhow::Result<Vec<StackFrameInfo>> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn disassemble(
+        &self,
+        _address: Option<u64>,
+        _count: u32,
+    ) -> anyhow::Result<DisassemblyResult> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn list_breakpoints(&self) -> anyhow::Result<Vec<BreakpointInfo>> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn add_code_breakpoint(&self, _address: u64) -> anyhow::Result<BreakpointInfo> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn add_data_breakpoint(
+        &self,
+        _address: u64,
+        _size: u32,
+        _access_type: u32,
+    ) -> anyhow::Result<BreakpointInfo> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn remove_breakpoint(&self, _breakpoint_id: u32) -> anyhow::Result<()> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn evaluate(&self, _expression: &str) -> anyhow::Result<EvaluationResult> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+}
+
+fn status_name(status: u32) -> String {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            DEBUG_STATUS_BREAK, DEBUG_STATUS_GO, DEBUG_STATUS_GO_HANDLED,
+            DEBUG_STATUS_GO_NOT_HANDLED, DEBUG_STATUS_NO_DEBUGGEE, DEBUG_STATUS_STEP_INTO,
+            DEBUG_STATUS_STEP_OVER, DEBUG_STATUS_TIMEOUT,
+        };
+
+        match status {
+            DEBUG_STATUS_GO => "go",
+            DEBUG_STATUS_GO_HANDLED => "go_handled",
+            DEBUG_STATUS_GO_NOT_HANDLED => "go_not_handled",
+            DEBUG_STATUS_STEP_INTO => "step_into",
+            DEBUG_STATUS_STEP_OVER => "step_over",
+            DEBUG_STATUS_BREAK => "break",
+            DEBUG_STATUS_NO_DEBUGGEE => "no_debuggee",
+            DEBUG_STATUS_TIMEOUT => "timeout",
+            _ => "unknown",
+        }
+        .to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = status;
+        "unknown".to_string()
+    }
 }
 
 #[cfg(windows)]
@@ -72,59 +819,193 @@ fn start_process_server_impl(options: ProcessServerOptions) -> anyhow::Result<Pr
 
 #[cfg(windows)]
 fn live_launch_initial_break_impl(options: LiveLaunchOptions) -> anyhow::Result<LiveLaunchResult> {
+    let session = launch_live_session_impl(LiveLaunchSessionOptions {
+        command_line: options.command_line.clone(),
+        initial_break_timeout_ms: options.initial_break_timeout_ms,
+    })?;
+    let execution_status = session.execution_status();
+    match options.end {
+        LiveLaunchEnd::Detach => session.detach()?,
+        LiveLaunchEnd::Terminate => session.terminate()?,
+    }
+
+    Ok(LiveLaunchResult {
+        command_line: options.command_line,
+        initial_break_timeout_ms: options.initial_break_timeout_ms,
+        wait_succeeded: true,
+        execution_status: execution_status.raw,
+        execution_status_name: execution_status.name,
+        end: options.end,
+    })
+}
+
+#[cfg(windows)]
+fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result<DebuggerSession> {
     use windows::core::{Interface, PCWSTR};
     use windows::Win32::System::Diagnostics::Debug::Extensions::{
-        DebugCreate, IDebugClient5, IDebugControl, DEBUG_PROCESS_ONLY_THIS_PROCESS,
-        DEBUG_STATUS_BREAK, DEBUG_STATUS_GO, DEBUG_STATUS_GO_HANDLED, DEBUG_STATUS_GO_NOT_HANDLED,
-        DEBUG_STATUS_NO_DEBUGGEE, DEBUG_STATUS_STEP_INTO, DEBUG_STATUS_TIMEOUT, DEBUG_WAIT_DEFAULT,
+        DebugCreate, IDebugClient5, IDebugControl5, IDebugDataSpaces4, IDebugRegisters,
+        IDebugSymbols5, IDebugSystemObjects, DEBUG_PROCESS_ONLY_THIS_PROCESS,
     };
 
     let mut command_line = options.command_line.encode_utf16().collect::<Vec<_>>();
     command_line.push(0);
 
     let client: IDebugClient5 = unsafe { DebugCreate()? };
-    let control: IDebugControl = client.cast()?;
+    let control: IDebugControl5 = client.cast()?;
+    let data_spaces: IDebugDataSpaces4 = client.cast()?;
+    let registers: IDebugRegisters = client.cast()?;
+    let symbols: IDebugSymbols5 = client.cast()?;
+    let system_objects: IDebugSystemObjects = client.cast()?;
     unsafe {
         client.CreateProcessWide(
             0,
             PCWSTR(command_line.as_ptr()),
             DEBUG_PROCESS_ONLY_THIS_PROCESS,
         )?;
+        control.WaitForEvent(
+            windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_WAIT_DEFAULT,
+            options.initial_break_timeout_ms,
+        )?;
     }
 
-    let wait_result =
-        unsafe { control.WaitForEvent(DEBUG_WAIT_DEFAULT, options.initial_break_timeout_ms) };
-    let wait_succeeded = wait_result.is_ok();
-    let execution_status = unsafe { control.GetExecutionStatus().ok() };
-    match options.end {
-        LiveLaunchEnd::Detach => unsafe {
-            client.DetachProcesses()?;
-        },
-        LiveLaunchEnd::Terminate => unsafe {
-            client.TerminateProcesses()?;
-        },
-    }
-
-    Ok(LiveLaunchResult {
-        command_line: options.command_line,
-        initial_break_timeout_ms: options.initial_break_timeout_ms,
-        wait_succeeded,
-        execution_status,
-        execution_status_name: execution_status.map(|status| {
-            match status {
-                DEBUG_STATUS_GO => "go",
-                DEBUG_STATUS_GO_HANDLED => "go_handled",
-                DEBUG_STATUS_GO_NOT_HANDLED => "go_not_handled",
-                DEBUG_STATUS_STEP_INTO => "step_into",
-                DEBUG_STATUS_BREAK => "break",
-                DEBUG_STATUS_NO_DEBUGGEE => "no_debuggee",
-                DEBUG_STATUS_TIMEOUT => "timeout",
-                _ => "unknown",
-            }
-            .to_string()
-        }),
-        end: options.end,
+    Ok(DebuggerSession {
+        kind: DebuggerSessionKind::Live,
+        target: options.command_line,
+        process_id: None,
+        dump_path: None,
+        client,
+        control,
+        data_spaces,
+        registers,
+        symbols,
+        system_objects,
     })
+}
+
+#[cfg(windows)]
+fn attach_live_session_impl(options: LiveAttachOptions) -> anyhow::Result<DebuggerSession> {
+    use windows::core::Interface;
+    use windows::Win32::System::Diagnostics::Debug::Extensions::{
+        DebugCreate, IDebugClient5, IDebugControl5, IDebugDataSpaces4, IDebugRegisters,
+        IDebugSymbols5, IDebugSystemObjects, DEBUG_ATTACH_DEFAULT, DEBUG_WAIT_DEFAULT,
+    };
+
+    let client: IDebugClient5 = unsafe { DebugCreate()? };
+    let control: IDebugControl5 = client.cast()?;
+    let data_spaces: IDebugDataSpaces4 = client.cast()?;
+    let registers: IDebugRegisters = client.cast()?;
+    let symbols: IDebugSymbols5 = client.cast()?;
+    let system_objects: IDebugSystemObjects = client.cast()?;
+    unsafe {
+        client.AttachProcess(0, options.process_id, DEBUG_ATTACH_DEFAULT)?;
+        control.WaitForEvent(DEBUG_WAIT_DEFAULT, options.initial_break_timeout_ms)?;
+    }
+
+    Ok(DebuggerSession {
+        kind: DebuggerSessionKind::Live,
+        target: format!("pid:{}", options.process_id),
+        process_id: Some(options.process_id),
+        dump_path: None,
+        client,
+        control,
+        data_spaces,
+        registers,
+        symbols,
+        system_objects,
+    })
+}
+
+#[cfg(windows)]
+fn open_dump_session_impl(options: DumpOpenOptions) -> anyhow::Result<DebuggerSession> {
+    use windows::core::{Interface, PCWSTR};
+    use windows::Win32::System::Diagnostics::Debug::Extensions::{
+        DebugCreate, IDebugClient5, IDebugControl5, IDebugDataSpaces4, IDebugRegisters,
+        IDebugSymbols5, IDebugSystemObjects, DEBUG_WAIT_DEFAULT,
+    };
+
+    let path_string = options.path.to_string_lossy().to_string();
+    let mut path = path_string.encode_utf16().collect::<Vec<_>>();
+    path.push(0);
+
+    let client: IDebugClient5 = unsafe { DebugCreate()? };
+    let control: IDebugControl5 = client.cast()?;
+    let data_spaces: IDebugDataSpaces4 = client.cast()?;
+    let registers: IDebugRegisters = client.cast()?;
+    let symbols: IDebugSymbols5 = client.cast()?;
+    let system_objects: IDebugSystemObjects = client.cast()?;
+    unsafe {
+        client.OpenDumpFileWide(PCWSTR(path.as_ptr()), 0)?;
+        control.WaitForEvent(DEBUG_WAIT_DEFAULT, 5000)?;
+    }
+
+    Ok(DebuggerSession {
+        kind: DebuggerSessionKind::Dump,
+        target: path_string,
+        process_id: None,
+        dump_path: Some(options.path),
+        client,
+        control,
+        data_spaces,
+        registers,
+        symbols,
+        system_objects,
+    })
+}
+
+#[cfg(windows)]
+fn read_wide_string<F>(mut reader: F) -> anyhow::Result<String>
+where
+    F: FnMut(&mut [u16], Option<*mut u32>) -> windows::core::Result<()>,
+{
+    let mut capacity = 256usize;
+    loop {
+        let mut buffer = vec![0u16; capacity];
+        let mut needed = 0u32;
+        reader(&mut buffer, Some(&mut needed))?;
+        if needed == 0 || (needed as usize) <= buffer.len() {
+            return Ok(decode_utf16(&buffer));
+        }
+        capacity = needed as usize;
+    }
+}
+
+#[cfg(windows)]
+fn decode_utf16(buffer: &[u16]) -> String {
+    let end = buffer
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..end])
+}
+
+fn debug_value_type_name(value_type: u32) -> &'static str {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            DEBUG_VALUE_FLOAT64, DEBUG_VALUE_INT64, DEBUG_VALUE_INVALID,
+        };
+
+        match value_type {
+            DEBUG_VALUE_INVALID => "invalid",
+            DEBUG_VALUE_INT64 => "int64",
+            DEBUG_VALUE_FLOAT64 => "float64",
+            _ => "other",
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = value_type;
+        "other"
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut result, "{byte:02x}");
+    }
+    result
 }
 
 #[cfg(not(windows))]
@@ -137,4 +1018,22 @@ fn start_process_server_impl(options: ProcessServerOptions) -> anyhow::Result<Pr
 fn live_launch_initial_break_impl(options: LiveLaunchOptions) -> anyhow::Result<LiveLaunchResult> {
     let _ = options;
     anyhow::bail!("DbgEng live launch is only supported on Windows")
+}
+
+#[cfg(not(windows))]
+fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result<DebuggerSession> {
+    let _ = options;
+    anyhow::bail!("DbgEng live launch is only supported on Windows")
+}
+
+#[cfg(not(windows))]
+fn attach_live_session_impl(options: LiveAttachOptions) -> anyhow::Result<DebuggerSession> {
+    let _ = options;
+    anyhow::bail!("DbgEng live attach is only supported on Windows")
+}
+
+#[cfg(not(windows))]
+fn open_dump_session_impl(options: DumpOpenOptions) -> anyhow::Result<DebuggerSession> {
+    let _ = options;
+    anyhow::bail!("DbgEng dump sessions are only supported on Windows")
 }
