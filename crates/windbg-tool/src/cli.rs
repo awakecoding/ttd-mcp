@@ -3293,8 +3293,8 @@ fn command_metadata() -> Value {
             "requires_daemon": false,
             "requires_native_ttd": false,
             "session_required": false,
-            "cost": "attaches_to_process_and_writes_dump",
-            "safety": "live_debugging_changes_target_execution_state",
+            "cost": "opens_process_handle_and_writes_dump",
+            "safety": "process_snapshot_read",
             "bounds": ["--kind mini|full", "--initial-break-timeout-ms", "--overwrite"]
         },
         {

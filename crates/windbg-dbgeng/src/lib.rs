@@ -322,17 +322,12 @@ impl DebuggerSession {
         if self.kind != DebuggerSessionKind::Live {
             bail!("DbgEng dump writing requires a live target session");
         }
-        write_dump_file(&self.client, &options)?;
-        Ok(DumpWriteResult {
-            path: options.path,
-            kind: options.kind,
-            qualifier: dump_kind_qualifier(options.kind),
-            format_flags: dump_format_flags(options.overwrite),
-            overwrite: options.overwrite,
-            target: self.target.clone(),
-            process_id: self.current_process_system_id().ok().or(self.process_id),
-            detached: false,
-        })
+        let process_id = self
+            .current_process_system_id()
+            .ok()
+            .or(self.process_id)
+            .context("no process id is available for this live target")?;
+        write_process_dump_file(process_id, self.target.clone(), false, options)
     }
 
     pub fn core_registers(&self) -> anyhow::Result<CoreRegisterState> {
@@ -1012,23 +1007,13 @@ fn open_dump_session_impl(options: DumpOpenOptions) -> anyhow::Result<DebuggerSe
 
 #[cfg(windows)]
 fn write_process_dump_impl(options: ProcessDumpOptions) -> anyhow::Result<DumpWriteResult> {
-    let session = attach_live_session_impl(LiveAttachOptions {
-        process_id: options.process_id,
-        initial_break_timeout_ms: options.initial_break_timeout_ms,
-    })?;
-    let write_result = session.write_dump(options.write);
-    let detach_result = session.detach();
-    match (write_result, detach_result) {
-        (Ok(mut result), Ok(())) => {
-            result.detached = true;
-            Ok(result)
-        }
-        (Ok(_), Err(error)) => Err(error).context("dump was written, but DbgEng detach failed"),
-        (Err(error), Ok(())) => Err(error),
-        (Err(write_error), Err(detach_error)) => Err(write_error).with_context(|| {
-            format!("DbgEng detach also failed after dump write failed: {detach_error}")
-        }),
-    }
+    let _ = options.initial_break_timeout_ms;
+    write_process_dump_file(
+        options.process_id,
+        format!("pid:{}", options.process_id),
+        false,
+        options.write,
+    )
 }
 
 #[cfg(windows)]
@@ -1079,14 +1064,14 @@ fn debug_value_type_name(value_type: u32) -> &'static str {
 }
 
 const DEBUG_DUMP_SMALL_VALUE: u32 = 1024;
-const DEBUG_DUMP_FULL_VALUE: u32 = 1026;
+const DEBUG_DUMP_DEFAULT_VALUE: u32 = 1025;
 const DEBUG_FORMAT_DEFAULT_VALUE: u32 = 0x0000_0000;
 const DEBUG_FORMAT_NO_OVERWRITE_VALUE: u32 = 0x8000_0000;
 
 fn dump_kind_qualifier(kind: DumpKind) -> u32 {
     match kind {
         DumpKind::Mini => DEBUG_DUMP_SMALL_VALUE,
-        DumpKind::Full => DEBUG_DUMP_FULL_VALUE,
+        DumpKind::Full => DEBUG_DUMP_DEFAULT_VALUE,
     }
 }
 
@@ -1108,25 +1093,89 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(windows)]
-fn write_dump_file(
-    client: &windows::Win32::System::Diagnostics::Debug::Extensions::IDebugClient5,
-    options: &DumpWriteOptions,
-) -> anyhow::Result<()> {
-    use windows::core::PCWSTR;
+fn write_process_dump_file(
+    process_id: u32,
+    target: String,
+    detached: bool,
+    options: DumpWriteOptions,
+) -> anyhow::Result<DumpWriteResult> {
+    use std::fs::OpenOptions;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Diagnostics::Debug::{
+        MiniDumpWithDataSegs, MiniDumpWithFullMemory, MiniDumpWithFullMemoryInfo,
+        MiniDumpWithHandleData, MiniDumpWithProcessThreadData, MiniDumpWithThreadInfo,
+        MiniDumpWithUnloadedModules, MiniDumpWriteDump, MINIDUMP_TYPE,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+    };
 
-    let path_string = options.path.to_string_lossy().to_string();
-    let mut path = path_string.encode_utf16().collect::<Vec<_>>();
-    path.push(0);
-    unsafe {
-        client.WriteDumpFileWide(
-            PCWSTR(path.as_ptr()),
-            0,
-            dump_kind_qualifier(options.kind),
-            dump_format_flags(options.overwrite),
-            PCWSTR(std::ptr::null()),
-        )?;
+    if !options.overwrite && options.path.exists() {
+        bail!("dump output already exists: {}", options.path.display());
     }
-    Ok(())
+
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+            false,
+            process_id,
+        )?
+    };
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(options.overwrite)
+        .create_new(!options.overwrite)
+        .open(&options.path)
+        .with_context(|| format!("failed to create dump file: {}", options.path.display()))?;
+
+    let dump_type = match options.kind {
+        DumpKind::Mini => MINIDUMP_TYPE(0),
+        DumpKind::Full => {
+            MiniDumpWithFullMemory
+                | MiniDumpWithHandleData
+                | MiniDumpWithUnloadedModules
+                | MiniDumpWithProcessThreadData
+                | MiniDumpWithFullMemoryInfo
+                | MiniDumpWithThreadInfo
+                | MiniDumpWithDataSegs
+        }
+    };
+
+    let write_result = unsafe {
+        MiniDumpWriteDump(
+            process,
+            process_id,
+            HANDLE(file.as_raw_handle()),
+            dump_type,
+            None,
+            None,
+            None,
+        )
+    };
+    unsafe {
+        CloseHandle(process)?;
+    }
+    if let Err(error) = write_result {
+        return Err(error).context("MiniDumpWriteDump failed");
+    }
+    drop(file);
+    let metadata = std::fs::metadata(&options.path)
+        .with_context(|| format!("dump file was not created: {}", options.path.display()))?;
+    if metadata.len() == 0 {
+        bail!("created an empty dump file: {}", options.path.display());
+    }
+    Ok(DumpWriteResult {
+        path: options.path,
+        kind: options.kind,
+        qualifier: dump_kind_qualifier(options.kind),
+        format_flags: dump_format_flags(options.overwrite),
+        overwrite: options.overwrite,
+        target,
+        process_id: Some(process_id),
+        detached,
+    })
 }
 
 #[cfg(not(windows))]
@@ -1172,7 +1221,7 @@ mod tests {
     #[test]
     fn maps_dump_kinds_to_dbgeng_qualifiers() {
         assert_eq!(dump_kind_qualifier(DumpKind::Mini), 1024);
-        assert_eq!(dump_kind_qualifier(DumpKind::Full), 1026);
+        assert_eq!(dump_kind_qualifier(DumpKind::Full), 1025);
     }
 
     #[test]

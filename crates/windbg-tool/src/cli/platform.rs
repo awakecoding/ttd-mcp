@@ -59,7 +59,7 @@ pub(super) fn run_dump_create(args: DumpCreateArgs, output: &OutputOptions) -> a
             "result": result,
             "session_persistence": "one_shot",
             "notes": [
-                "DbgEng attaches to the process to create the dump and detaches before returning."
+                "DbgHelp writes the dump from a process handle using the Microsoft Debugging Platform runtime staged by cargo xtask deps."
             ]
         }),
         output,
@@ -93,8 +93,8 @@ pub(super) fn live_capabilities() -> Value {
             },
             {
                 "feature": "dump creation",
-                "status": "dbgeng_write_dump",
-                "notes": "Creates mini or full process dumps through DbgEng, either one-shot from a process id or from a daemon-owned live target."
+                "status": "dbghelp_minidump_writer",
+                "notes": "Creates mini or full process dumps through DbgHelp from the Microsoft Debugging Platform runtime, either one-shot from a process id or from a daemon-owned live target."
             },
             {
                 "feature": "daemon-backed live sessions",

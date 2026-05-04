@@ -9,6 +9,7 @@ jobs:
   dump-smoke:
     name: Process dump smoke test
     runs-on: windows-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -28,6 +29,7 @@ jobs:
 
       - name: Create and inspect ping dump
         shell: pwsh
+        timeout-minutes: 10
         run: |
           $ErrorActionPreference = 'Stop'
 
@@ -37,6 +39,7 @@ jobs:
           $dumpPath = Join-Path $dumpDir 'ping.dmp'
           Remove-Item -Path $dumpPath -Force -ErrorAction SilentlyContinue
 
+          Write-Host 'Launching ping.exe'
           $ping = Start-Process `
             -FilePath 'C:\Windows\System32\ping.exe' `
             -ArgumentList @('127.0.0.1', '-n', '10') `
@@ -45,11 +48,13 @@ jobs:
           try {
             Start-Sleep -Seconds 1
 
-            & $tool dump create `
+            Write-Host 'Creating process dump'
+            $created = & $tool dump create `
               --process-id $ping.Id `
               --output $dumpPath `
               --kind mini `
-              --overwrite | ConvertFrom-Json | Out-Null
+              --overwrite | Tee-Object -Variable createOutput
+            $createOutput | ConvertFrom-Json | Out-Null
 
             if (-not (Test-Path $dumpPath)) {
               throw "Expected dump file was not created: $dumpPath"
@@ -62,24 +67,29 @@ jobs:
           }
           finally {
             if (-not $ping.HasExited) {
+              Write-Host 'Terminating ping.exe'
               Stop-Process -Id $ping.Id -Force
               $ping.WaitForExit()
             }
           }
 
+          Write-Host 'Ensuring daemon'
           & $tool daemon ensure | ConvertFrom-Json | Out-Null
 
+          Write-Host 'Opening dump'
           $opened = & $tool dump open $dumpPath | ConvertFrom-Json
           if (-not $opened.target_id) {
             throw "dump open did not return a target_id"
           }
           $target = $opened.target_id
 
+          Write-Host 'Checking target status'
           $status = & $tool target status --target $target | ConvertFrom-Json
           if ($status.target.kind -ne 'dump') {
             throw "Expected dump target kind, got '$($status.target.kind)'"
           }
 
+          Write-Host 'Checking modules'
           $modules = & $tool target modules --target $target | ConvertFrom-Json
           $pingModule = $modules.modules | Where-Object {
             ($_.module_name -like '*ping*') -or
@@ -90,11 +100,13 @@ jobs:
             throw "Expected loaded modules to include ping.exe"
           }
 
+          Write-Host 'Checking threads'
           $threads = & $tool target threads --target $target | ConvertFrom-Json
           if (-not $threads.threads -or $threads.threads.Count -lt 1) {
             throw "Expected at least one thread in the dump"
           }
 
+          Write-Host 'Checking registers'
           $registers = & $tool target registers --target $target | ConvertFrom-Json
           if (
             -not $registers.registers.instruction_offset -and
@@ -104,6 +116,7 @@ jobs:
             throw "Expected at least one current-thread register offset in the dump"
           }
 
+          Write-Host 'Checking stack'
           $stack = & $tool target stack --target $target --max-frames 8 | ConvertFrom-Json
           if (-not $stack.frames -or $stack.frames.Count -lt 1) {
             throw "Expected at least one stack frame in the dump"
