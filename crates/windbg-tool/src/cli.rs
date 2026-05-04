@@ -8,15 +8,17 @@ use rmcp::{transport::stdio, ServiceExt};
 use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use windbg_dbgeng::{
-    live_launch_initial_break, start_process_server, LiveLaunchEnd, LiveLaunchOptions,
-    ProcessServerOptions,
-};
-use windbg_install::WindbgManager;
 use windbg_ttd::daemon::{default_pipe_name, run_daemon, DaemonClient};
 use windbg_ttd::server::TtdMcpServer;
 use windbg_ttd::tools::{self, ToolCall};
+
+mod daemon_mode;
+mod dispatch;
+mod output;
+mod platform;
+mod remote;
+
+use output::{print_value, OutputOptions};
 
 #[derive(Debug, Parser)]
 #[command(about = "WinDbg Time Travel Debugging MCP server, daemon, and CLI")]
@@ -39,13 +41,6 @@ struct Cli {
     raw: bool,
     #[command(subcommand)]
     command: Option<Commands>,
-}
-
-#[derive(Debug, Clone)]
-struct OutputOptions {
-    compact: bool,
-    field: Option<String>,
-    raw: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -82,6 +77,10 @@ enum Commands {
     Live {
         #[command(subcommand)]
         command: LiveCommand,
+    },
+    Dump {
+        #[command(subcommand)]
+        command: DumpCommand,
     },
     #[command(
         name = "dbgsrv",
@@ -178,6 +177,10 @@ enum Commands {
         #[command(subcommand)]
         command: SweepCommand,
     },
+    Job {
+        #[command(subcommand)]
+        command: JobCommand,
+    },
     Breakpoint {
         #[command(subcommand)]
         command: BreakpointCommand,
@@ -245,8 +248,18 @@ enum LiveCommand {
         about = "Launch a process under DbgEng, wait for the initial event, then detach or terminate"
     )]
     Launch(LiveLaunchArgs),
+    #[command(about = "Launch a process under DbgEng and keep it as a daemon-owned live target")]
+    Start(LiveSessionStartArgs),
+    #[command(about = "Attach DbgEng to a process and keep it as a daemon-owned live target")]
+    Attach(LiveAttachArgs),
     #[command(about = "Show live DbgEng command support and current limitations")]
     Capabilities,
+}
+
+#[derive(Debug, Subcommand)]
+enum DumpCommand {
+    #[command(about = "Open a dump file as a daemon-owned target")]
+    Open(DumpOpenArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -317,12 +330,32 @@ enum SweepCommand {
 enum BreakpointCommand {
     #[command(about = "Show breakpoint/watchpoint manager support and current gaps")]
     Capabilities,
+    #[command(about = "List live breakpoints for a daemon-owned live target")]
+    List(TargetIdArgs),
+    #[command(about = "Set a code or data breakpoint for a daemon-owned live target")]
+    Set(BreakpointSetArgs),
+    #[command(about = "Remove a breakpoint from a daemon-owned live target")]
+    Remove(BreakpointRemoveArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum JobCommand {
+    #[command(about = "List daemon-owned replay jobs")]
+    List,
+    #[command(about = "Show daemon-owned replay job status")]
+    Status(JobIdArgs),
+    #[command(about = "Fetch the latest daemon-owned replay job result")]
+    Result(JobIdArgs),
+    #[command(about = "Request cancellation for a daemon-owned replay job")]
+    Cancel(JobIdArgs),
 }
 
 #[derive(Debug, Subcommand)]
 enum DataModelCommand {
     #[command(about = "Show DbgEng data model / target model support and current gaps")]
     Capabilities,
+    #[command(about = "Evaluate a DbgEng expression against a daemon-owned target")]
+    Eval(DataModelEvalArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -331,6 +364,38 @@ enum TargetCommand {
         about = "Show target-kind capabilities for TTD, live, dump, and future target models"
     )]
     Capabilities(TargetCapabilitiesArgs),
+    #[command(about = "List daemon-owned live and dump targets")]
+    List,
+    #[command(about = "Show status for a daemon-owned target")]
+    Status(TargetIdArgs),
+    #[command(about = "Close a daemon-owned target")]
+    Close(TargetIdArgs),
+    #[command(about = "Terminate and close a daemon-owned live target")]
+    Terminate(TargetIdArgs),
+    #[command(about = "Wait for the next debug event on a daemon-owned live target")]
+    Wait(TargetWaitArgs),
+    #[command(about = "Continue execution of a daemon-owned live target")]
+    Continue(TargetIdArgs),
+    #[command(about = "Single-step a daemon-owned live target")]
+    Step(TargetIdArgs),
+    #[command(about = "List threads for a daemon-owned target")]
+    Threads(TargetIdArgs),
+    #[command(about = "List modules for a daemon-owned target")]
+    Modules(TargetIdArgs),
+    #[command(about = "Read current thread and instruction offsets for a daemon-owned target")]
+    Registers(TargetIdArgs),
+    #[command(about = "Read memory from a daemon-owned target")]
+    Memory(TargetMemoryReadArgs),
+    #[command(about = "Walk the current stack for a daemon-owned target")]
+    Stack(TargetStackTraceArgs),
+    #[command(about = "Disassemble instructions from a daemon-owned target")]
+    Disasm(TargetDisasmArgs),
+    #[command(about = "Resolve the nearest symbol for a daemon-owned target address")]
+    Symbol(TargetAddressArgs),
+    #[command(
+        about = "Resolve source file and line information for a daemon-owned target address"
+    )]
+    Source(TargetAddressArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -436,6 +501,27 @@ struct LiveLaunchArgs {
     initial_break_timeout_ms: u32,
     #[arg(long, default_value = "detach", value_parser = ["detach", "terminate"])]
     end: String,
+}
+
+#[derive(Debug, Args)]
+struct LiveSessionStartArgs {
+    #[arg(long, help = "Full command line to launch under DbgEng")]
+    command_line: String,
+    #[arg(long, default_value_t = 5000)]
+    initial_break_timeout_ms: u32,
+}
+
+#[derive(Debug, Args)]
+struct LiveAttachArgs {
+    #[arg(long, help = "Process id to attach under DbgEng")]
+    process_id: u32,
+    #[arg(long, default_value_t = 5000)]
+    initial_break_timeout_ms: u32,
+}
+
+#[derive(Debug, Args)]
+struct DumpOpenArgs {
+    path: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -604,6 +690,90 @@ struct TargetCapabilitiesArgs {
     session: Option<u64>,
     #[arg(short = 'c', long)]
     cursor: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+struct TargetIdArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+}
+
+#[derive(Debug, Args)]
+struct JobIdArgs {
+    #[arg(short = 'j', long = "job")]
+    job: u64,
+}
+
+#[derive(Debug, Args)]
+struct TargetWaitArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(long, default_value_t = 5000)]
+    timeout_ms: u32,
+}
+
+#[derive(Debug, Args)]
+struct TargetAddressArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(long)]
+    address: String,
+}
+
+#[derive(Debug, Args)]
+struct TargetMemoryReadArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(long)]
+    address: String,
+    #[arg(long)]
+    size: u32,
+}
+
+#[derive(Debug, Args)]
+struct TargetStackTraceArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(long, default_value_t = 32)]
+    max_frames: u32,
+}
+
+#[derive(Debug, Args)]
+struct TargetDisasmArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(long)]
+    address: Option<String>,
+    #[arg(long, default_value_t = 16)]
+    count: u32,
+}
+
+#[derive(Debug, Args)]
+struct BreakpointSetArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(long)]
+    address: String,
+    #[arg(long, default_value = "code", value_parser = ["code", "read", "write", "execute", "read_write"])]
+    kind: String,
+    #[arg(long)]
+    size: Option<u32>,
+}
+
+#[derive(Debug, Args)]
+struct BreakpointRemoveArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(long)]
+    breakpoint_id: u32,
+}
+
+#[derive(Debug, Args)]
+struct DataModelEvalArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(long)]
+    expression: String,
 }
 
 #[derive(Debug, Args)]
@@ -1101,340 +1271,12 @@ struct SweepWatchMemoryArgs {
     thread_unique_id: Option<u64>,
     #[arg(long, default_value_t = 16)]
     max_hits: usize,
+    #[arg(long, help = "Run the sweep as a daemon-owned background job")]
+    background: bool,
 }
 
 pub async fn run() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    let output = OutputOptions {
-        compact: cli.compact,
-        field: cli.field,
-        raw: cli.raw,
-    };
-    let pipe = cli.pipe.unwrap_or_else(default_pipe_name);
-
-    match cli.command {
-        None | Some(Commands::Mcp) => run_mcp_stdio().await,
-        Some(Commands::Discover) => print_value(discover_manifest(), &output),
-        Some(Commands::Recipes(args)) => print_value(recipes_value(args)?, &output),
-        Some(Commands::Schema(args)) => print_value(tool_schema(&args.tool)?, &output),
-        Some(Commands::Trace { command }) => match command {
-            TraceCommand::List(args) => call_and_print(pipe, trace_list_call(args), &output).await,
-        },
-        Some(Commands::TraceList(args)) => {
-            call_and_print(pipe, trace_list_call(args), &output).await
-        }
-        Some(Commands::Daemon { command }) => run_daemon_command(command, pipe, &output).await,
-        Some(Commands::DbgEng { command }) => match command {
-            DbgEngCommand::Server(args) => run_dbgeng_server(args, &output),
-        },
-        Some(Commands::Live { command }) => match command {
-            LiveCommand::Launch(args) => run_live_launch(args, &output),
-            LiveCommand::Capabilities => print_value(live_capabilities(), &output),
-        },
-        Some(Commands::DbgSrv(args)) => run_dbgeng_server(args, &output),
-        Some(Commands::Remote { command }) => print_value(remote_command_value(command)?, &output),
-        Some(Commands::Windbg { command }) => run_windbg_command(command, &output),
-        Some(Commands::Open(args)) => open_and_print(pipe, args, &output).await,
-        Some(Commands::Load(args)) => call_and_print(pipe, load_call(args), &output).await,
-        Some(Commands::Sessions) => {
-            let client = DaemonClient::new(pipe);
-            print_value(client.sessions().await?, &output)
-        }
-        Some(Commands::Context { command }) => match command {
-            ContextCommand::Snapshot(args) => context_snapshot_and_print(pipe, args, &output).await,
-        },
-        Some(Commands::Close(args)) => {
-            call_and_print(pipe, session_call("ttd_close_trace", args), &output).await
-        }
-        Some(Commands::Info(args)) => {
-            call_and_print(pipe, session_call("ttd_trace_info", args), &output).await
-        }
-        Some(Commands::Symbols { command }) => match command {
-            SymbolsCommand::Diagnose(args) => symbols_diagnose_and_print(pipe, args, &output).await,
-            SymbolsCommand::Inspect(args) => print_value(diagnose_pe(&args.path)?, &output),
-            SymbolsCommand::Exports(args) => symbols_exports_and_print(args, &output),
-            SymbolsCommand::Nearest(args) => symbols_nearest_and_print(pipe, args, &output).await,
-        },
-        Some(Commands::Source { command }) => match command {
-            SourceCommand::Resolve(args) => print_value(source_resolve(args)?, &output),
-        },
-        Some(Commands::Architecture { command }) => match command {
-            ArchitectureCommand::State(args) => {
-                architecture_state_and_print(pipe, args, &output).await
-            }
-        },
-        Some(Commands::Capabilities(args)) => {
-            call_and_print(pipe, session_call("ttd_capabilities", args), &output).await
-        }
-        Some(Commands::Index { command }) => match command {
-            IndexCommand::Status(args) => {
-                call_and_print(pipe, session_call("ttd_index_status", args), &output).await
-            }
-            IndexCommand::Stats(args) => {
-                call_and_print(pipe, session_call("ttd_index_stats", args), &output).await
-            }
-            IndexCommand::Build(args) => {
-                call_and_print(pipe, index_build_call(args), &output).await
-            }
-        },
-        Some(Commands::Tools) => print_value(json!({ "tools": tools::definitions() }), &output),
-        Some(Commands::Tool(args)) => {
-            let name = args.name.clone();
-            let arguments = tool_arguments(args)?;
-            call_and_print(pipe, ToolCall { name, arguments }, &output).await
-        }
-        Some(Commands::Threads(args)) => {
-            call_and_print(pipe, session_call("ttd_list_threads", args), &output).await
-        }
-        Some(Commands::Modules(args)) => {
-            call_and_print(pipe, session_call("ttd_list_modules", args), &output).await
-        }
-        Some(Commands::Keyframes(args)) => {
-            call_and_print(pipe, session_call("ttd_list_keyframes", args), &output).await
-        }
-        Some(Commands::Exceptions(args)) => {
-            call_and_print(pipe, session_call("ttd_list_exceptions", args), &output).await
-        }
-        Some(Commands::Events { command }) => match command {
-            EventsCommand::Modules(args) => {
-                call_and_print(pipe, session_call("ttd_module_events", args), &output).await
-            }
-            EventsCommand::Threads(args) => {
-                call_and_print(pipe, session_call("ttd_thread_events", args), &output).await
-            }
-        },
-        Some(Commands::Timeline { command }) => match command {
-            TimelineCommand::Events(args) => timeline_events_and_print(pipe, args, &output).await,
-        },
-        Some(Commands::Module { command }) => match command {
-            ModuleCommand::Info(args) => {
-                call_and_print(pipe, module_info_call(args)?, &output).await
-            }
-            ModuleCommand::Audit(args) => module_audit_and_print(pipe, args, &output).await,
-            ModuleCommand::SearchOrder(args) => module_search_order_and_print(args, &output),
-        },
-        Some(Commands::Address(args)) => {
-            call_and_print(pipe, address_info_call(args), &output).await
-        }
-        Some(Commands::Cursor { command }) => match command {
-            CursorCommand::Create(args) => {
-                call_and_print(pipe, session_call("ttd_cursor_create", args), &output).await
-            }
-            CursorCommand::Modules(args) => {
-                call_and_print(pipe, cursor_call("ttd_cursor_modules", args), &output).await
-            }
-        },
-        Some(Commands::ActiveThreads(args)) => {
-            call_and_print(pipe, cursor_call("ttd_active_threads", args), &output).await
-        }
-        Some(Commands::Position { command }) => match command {
-            PositionCommand::Get(args) => {
-                call_and_print(pipe, cursor_call("ttd_position_get", args), &output).await
-            }
-            PositionCommand::Set(args) => {
-                call_and_print(pipe, position_set_call(args)?, &output).await
-            }
-        },
-        Some(Commands::Step(args)) => call_and_print(pipe, step_call(args), &output).await,
-        Some(Commands::Replay { command }) => match command {
-            ReplayCommand::Capabilities(args) => {
-                replay_capabilities_and_print(pipe, args, &output).await
-            }
-            ReplayCommand::To(args) => replay_to_and_print(pipe, args, &output).await,
-            ReplayCommand::WatchMemory(args) => {
-                call_and_print(pipe, watchpoint_call(args)?, &output).await
-            }
-        },
-        Some(Commands::Sweep { command }) => match command {
-            SweepCommand::WatchMemory(args) => {
-                sweep_watch_memory_and_print(pipe, args, &output).await
-            }
-        },
-        Some(Commands::Breakpoint { command }) => match command {
-            BreakpointCommand::Capabilities => print_value(breakpoint_capabilities(), &output),
-        },
-        Some(Commands::Datamodel { command }) => match command {
-            DataModelCommand::Capabilities => print_value(datamodel_capabilities(), &output),
-        },
-        Some(Commands::Target { command }) => match command {
-            TargetCommand::Capabilities(args) => {
-                target_capabilities_and_print(pipe, args, &output).await
-            }
-        },
-        Some(Commands::Disasm(args)) => disasm_and_print(pipe, args, &output).await,
-        Some(Commands::Registers(args)) => {
-            call_and_print(pipe, cursor_call("ttd_registers", args), &output).await
-        }
-        Some(Commands::RegisterContext(args)) => {
-            call_and_print(pipe, register_context_call(args), &output).await
-        }
-        Some(Commands::Stack { command }) => match command {
-            StackCommand::Info(args) => {
-                call_and_print(pipe, cursor_call("ttd_stack_info", args), &output).await
-            }
-            StackCommand::Read(args) => call_and_print(pipe, stack_read_call(args), &output).await,
-            StackCommand::Recover(args) => stack_recover_and_print(pipe, args, &output).await,
-            StackCommand::Backtrace(args) => stack_backtrace_and_print(pipe, args, &output).await,
-        },
-        Some(Commands::CommandLine(args)) => {
-            call_and_print(pipe, cursor_call("ttd_command_line", args), &output).await
-        }
-        Some(Commands::Memory { command }) => match command {
-            MemoryCommand::Read(args) => {
-                call_and_print(pipe, memory_read_call(args)?, &output).await
-            }
-            MemoryCommand::Range(args) => {
-                call_and_print(pipe, memory_range_call(args)?, &output).await
-            }
-            MemoryCommand::Buffer(args) => {
-                call_and_print(pipe, memory_buffer_call(args)?, &output).await
-            }
-            MemoryCommand::Dump(args) => memory_dump_and_print(pipe, args, &output).await,
-            MemoryCommand::Classify(args) => memory_classify_and_print(pipe, args, &output).await,
-            MemoryCommand::Strings(args) => memory_strings_and_print(pipe, args, &output).await,
-            MemoryCommand::Dps(args) => memory_dps_and_print(pipe, args, &output).await,
-            MemoryCommand::Chase(args) => memory_chase_and_print(pipe, args, &output).await,
-            MemoryCommand::Watchpoint(args) => {
-                call_and_print(pipe, watchpoint_call(args)?, &output).await
-            }
-        },
-        Some(Commands::Object { command }) => match command {
-            ObjectCommand::Vtable(args) => object_vtable_and_print(pipe, args, &output).await,
-        },
-        Some(Commands::Watchpoint(args)) => {
-            call_and_print(pipe, watchpoint_call(args)?, &output).await
-        }
-    }
-}
-
-fn run_dbgeng_server(args: DbgEngServerArgs, output: &OutputOptions) -> anyhow::Result<()> {
-    let result = start_process_server(ProcessServerOptions {
-        transport: args.transport,
-    })?;
-    print_value(serde_json::to_value(result)?, output)
-}
-
-fn run_live_launch(args: LiveLaunchArgs, output: &OutputOptions) -> anyhow::Result<()> {
-    let end = match args.end.as_str() {
-        "detach" => LiveLaunchEnd::Detach,
-        "terminate" => LiveLaunchEnd::Terminate,
-        other => bail!("unsupported live launch end action: {other}"),
-    };
-    let result = live_launch_initial_break(LiveLaunchOptions {
-        command_line: args.command_line,
-        initial_break_timeout_ms: args.initial_break_timeout_ms,
-        end,
-    })?;
-    print_value(
-        json!({
-            "result": result,
-            "session_persistence": "one_shot",
-            "notes": [
-                "This is the first live DbgEng primitive, not the daemon-backed live session manager.",
-                "Use --end detach to leave the process running or --end terminate for disposable test targets."
-            ]
-        }),
-        output,
-    )
-}
-
-fn live_capabilities() -> Value {
-    json!({
-        "implemented": [
-            "dbgeng server",
-            "live launch --command-line <cmd> --end detach|terminate"
-        ],
-        "partial": [
-            {
-                "feature": "live launch",
-                "status": "one_shot_initial_event",
-                "notes": "Launches under DbgEng, waits for the initial event, reports execution status, then detaches or terminates."
-            }
-        ],
-        "gaps": [
-            "daemon-backed live session persistence",
-            "attach by pid",
-            "detach/list persisted live sessions",
-            "structured debug event polling",
-            "live registers/memory/modules/threads",
-            "continue and stepping with explicit exception handling",
-            "breakpoint manager"
-        ],
-        "safety": [
-            "Live debugging mutates target execution state.",
-            "Commands that launch or attach are explicit and are not hidden behind read-only names."
-        ]
-    })
-}
-
-fn breakpoint_capabilities() -> Value {
-    json!({
-        "implemented": [
-            "memory watchpoint",
-            "replay watch-memory",
-            "sweep watch-memory"
-        ],
-        "partial": [
-            {
-                "feature": "TTD multi-hit memory watchpoint sweeps",
-                "status": "bounded_foreground_sweep",
-                "command": "sweep watch-memory",
-                "bounds": ["--max-hits"],
-                "notes": "Collects repeated first-hit memory watchpoints by advancing the cursor one step after each hit."
-            }
-        ],
-        "gaps": [
-            "live software breakpoint set/list/clear/enable/disable",
-            "live hardware execute/data breakpoints",
-            "source and symbol breakpoints",
-            "daemon-owned background replay jobs",
-            "job progress and cancellation",
-            "position watchpoints",
-            "call/return trace jobs"
-        ],
-        "safe_next_steps": [
-            "Use memory watchpoint for one hit.",
-            "Use sweep watch-memory for bounded repeated TTD data-access hits.",
-            "Use live capabilities before expecting live breakpoint manager support."
-        ]
-    })
-}
-
-fn datamodel_capabilities() -> Value {
-    json!({
-        "implemented": [
-            "structured JSON command output",
-            "discover.command_metadata",
-            "recipes",
-            "context snapshot",
-            "architecture state"
-        ],
-        "partial": [
-            {
-                "feature": "data-model-like discovery",
-                "status": "JSON manifests and command metadata",
-                "notes": "Commands expose stable structured data, but do not yet bridge DbgEng dx or TargetModel services."
-            }
-        ],
-        "gaps": [
-            "DbgEng dx expression evaluation",
-            "Debugger data model object projection",
-            "Microsoft.Debugging.TargetModel.SDK component hosting",
-            "service-oriented abstraction shared by TTD/live/dump targets",
-            "dump target sessions"
-        ],
-        "recommended_abstractions": [
-            "memory",
-            "registers",
-            "modules",
-            "symbols",
-            "threads",
-            "events",
-            "stack",
-            "disassembly",
-            "breakpoints"
-        ]
-    })
+    dispatch::run_cli().await
 }
 
 async fn target_capabilities_and_print(
@@ -1442,8 +1284,9 @@ async fn target_capabilities_and_print(
     args: TargetCapabilitiesArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
+    let client = DaemonClient::new(pipe.clone());
+    let daemon_targets = call_status_value(client.targets().await);
     let selected_ttd = if let Some(session) = args.session {
-        let client = DaemonClient::new(pipe);
         let capabilities = call_status_value(
             client
                 .call_tool(session_call("ttd_capabilities", SessionArgs { session }))
@@ -1475,6 +1318,7 @@ async fn target_capabilities_and_print(
     print_value(
         json!({
             "selected_ttd": selected_ttd,
+            "daemon_targets": daemon_targets,
             "target_kinds": [
                 {
                     "kind": "ttd_trace",
@@ -1487,25 +1331,56 @@ async fn target_capabilities_and_print(
                     "status": "partial",
                     "entry": "live launch",
                     "supports": ["launch", "initial_debug_event_status", "detach_or_terminate"],
-                    "missing": ["persisted_sessions", "attach", "event_loop", "registers", "memory", "breakpoints"]
+                    "missing": ["persistence", "attach", "interactive session control"]
                 },
                 {
                     "kind": "live_dbgeng_daemon",
-                    "status": "gap",
-                    "entry": null,
-                    "missing": ["launch_or_attach", "session_list", "event_poll", "continue_step", "registers", "memory", "modules", "threads"]
+                    "status": "partial",
+                    "entry": ["live start", "live attach", "target ..."],
+                    "supports": [
+                        "launch_or_attach",
+                        "session_list",
+                        "status",
+                        "wait",
+                        "continue",
+                        "step_into",
+                        "registers",
+                        "memory",
+                        "modules",
+                        "threads",
+                        "stack",
+                        "symbol_lookup",
+                        "source_lookup",
+                        "disassembly",
+                        "breakpoints",
+                        "expression_evaluation"
+                    ],
+                    "missing": ["event_streaming", "step_over", "step_out", "symbol_breakpoints", "output_capture"]
                 },
                 {
                     "kind": "dump",
-                    "status": "gap",
-                    "entry": null,
-                    "missing": ["dump_open", "memory", "modules", "threads", "stack", "symbols"]
+                    "status": "partial",
+                    "entry": ["dump open", "target ..."],
+                    "supports": [
+                        "dump_open",
+                        "status",
+                        "memory",
+                        "modules",
+                        "threads",
+                        "registers",
+                        "stack",
+                        "symbols",
+                        "source",
+                        "disassembly",
+                        "expression_evaluation"
+                    ],
+                    "missing": ["write_actions", "breakpoint_control", "event_wait"]
                 },
                 {
                     "kind": "target_model",
-                    "status": "gap",
-                    "entry": null,
-                    "missing": ["DbgEng dx", "TargetModel SDK component hosting"]
+                    "status": "partial",
+                    "entry": ["datamodel eval"],
+                    "missing": ["DbgEng dx object graphs", "TargetModel SDK component hosting"]
                 }
             ],
             "service_axes": ["memory", "registers", "modules", "threads", "events", "symbols", "stack", "disassembly", "breakpoints"],
@@ -1516,202 +1391,6 @@ async fn target_capabilities_and_print(
         }),
         output,
     )
-}
-
-fn remote_command_value(command: RemoteCommand) -> anyhow::Result<Value> {
-    match command {
-        RemoteCommand::Explain(args) => {
-            let workflows = remote_workflows();
-            let Some(kind) = args.kind else {
-                return Ok(json!({
-                    "workflows": workflows,
-                    "default": "dbgsrv",
-                    "recipes": ["windbg-tool recipes remote-debugging"],
-                }));
-            };
-            Ok(json!({
-                "workflow": remote_workflow(kind),
-                "recipes": ["windbg-tool recipes remote-debugging"],
-            }))
-        }
-        RemoteCommand::ServerCommand(args) => {
-            if matches!(args.kind, RemoteKind::Ntsd)
-                && args.pid.is_some()
-                && args.executable.is_some()
-            {
-                bail!("remote server-command --kind ntsd accepts either --pid or --executable, not both")
-            }
-            Ok(json!({
-                "side": "target",
-                "workflow": remote_workflow(args.kind),
-                "command": remote_server_command(&args),
-                "notes": remote_server_notes(&args),
-            }))
-        }
-        RemoteCommand::ConnectCommand(args) => Ok(json!({
-            "side": "host",
-            "workflow": remote_workflow(args.kind),
-            "command": remote_connect_command(&args),
-            "notes": remote_connect_notes(&args),
-        })),
-    }
-}
-
-fn remote_workflows() -> Value {
-    json!([
-        remote_workflow(RemoteKind::Dbgsrv),
-        remote_workflow(RemoteKind::Ntsd)
-    ])
-}
-
-fn remote_workflow(kind: RemoteKind) -> Value {
-    match kind {
-        RemoteKind::Dbgsrv => json!({
-            "kind": "dbgsrv",
-            "summary": "DbgEng process server: debugger brains, symbols, and extensions stay on the host.",
-            "use_when": [
-                "target should stay lightweight",
-                "host owns symbol/source paths and extensions",
-                "host should launch or attach through -premote"
-            ],
-            "target_side": "windbg-tool dbgeng server --transport tcp:port=5005",
-            "host_side": "windbg-tool windbg run -- -premote tcp:port=5005,server=<target>"
-        }),
-        RemoteKind::Ntsd => json!({
-            "kind": "ntsd",
-            "summary": "NTSD/CDB remote session: debugger brains, symbols, and extensions run on the target.",
-            "use_when": [
-                "latency is high and command execution should be target-local",
-                "target has the necessary symbols/extensions",
-                "a preexisting debugger session should be exposed remotely"
-            ],
-            "target_side": "ntsd -server tcp:port=5005 -p <pid>",
-            "host_side": "windbg-tool windbg run -- -remote tcp:port=5005,server=<target>"
-        }),
-    }
-}
-
-fn remote_server_command(args: &RemoteServerCommandArgs) -> Vec<String> {
-    match args.kind {
-        RemoteKind::Dbgsrv => vec![
-            "windbg-tool".to_string(),
-            "dbgeng".to_string(),
-            "server".to_string(),
-            "--transport".to_string(),
-            args.transport.clone(),
-        ],
-        RemoteKind::Ntsd => {
-            let mut command = vec![
-                "ntsd".to_string(),
-                "-server".to_string(),
-                args.transport.clone(),
-            ];
-            if let Some(pid) = args.pid {
-                command.push("-p".to_string());
-                command.push(pid.to_string());
-            } else if let Some(executable) = &args.executable {
-                command.push(executable.clone());
-            } else {
-                command.push("-p".to_string());
-                command.push("<pid>".to_string());
-            }
-            command
-        }
-    }
-}
-
-fn remote_server_notes(args: &RemoteServerCommandArgs) -> Value {
-    match args.kind {
-        RemoteKind::Dbgsrv => json!([
-            "Run on the target machine.",
-            "The command blocks until the DbgEng process server exits.",
-            "Use remote connect-command --kind dbgsrv on the host to generate the WinDbg -premote command."
-        ]),
-        RemoteKind::Ntsd => json!([
-            "Run on the target machine with NTSD or CDB available.",
-            "Symbols and extensions are resolved by the target-side debugger process.",
-            "Use remote connect-command --kind ntsd on the host to generate the WinDbg -remote command."
-        ]),
-    }
-}
-
-fn remote_connect_command(args: &RemoteConnectCommandArgs) -> Vec<String> {
-    let remote = format!("{},server={}", args.transport, args.server);
-    match args.kind {
-        RemoteKind::Dbgsrv => vec![
-            "windbg-tool".to_string(),
-            "windbg".to_string(),
-            "run".to_string(),
-            "--".to_string(),
-            "-premote".to_string(),
-            remote,
-        ],
-        RemoteKind::Ntsd => vec![
-            "windbg-tool".to_string(),
-            "windbg".to_string(),
-            "run".to_string(),
-            "--".to_string(),
-            "-remote".to_string(),
-            remote,
-        ],
-    }
-}
-
-fn remote_connect_notes(args: &RemoteConnectCommandArgs) -> Value {
-    match args.kind {
-        RemoteKind::Dbgsrv => json!([
-            "Run on the host machine.",
-            "This connects WinDbg to a DbgSrv process server; launch/attach decisions happen from the host.",
-            "Append additional WinDbg launch/attach arguments after the generated -premote transport if needed."
-        ]),
-        RemoteKind::Ntsd => json!([
-            "Run on the host machine.",
-            "This connects WinDbg to an existing target-side NTSD/CDB -server session.",
-            "Do not use -premote for NTSD/CDB -server sessions."
-        ]),
-    }
-}
-
-fn run_windbg_command(command: WindbgCommand, output: &OutputOptions) -> anyhow::Result<()> {
-    match command {
-        WindbgCommand::Status(args) => {
-            let _ = args.json;
-            let manager = WindbgManager::new(args.install_dir)?;
-            print_value(serde_json::to_value(manager.status(true)?)?, output)
-        }
-        WindbgCommand::Install(args) => {
-            let _ = args.json;
-            let manager = WindbgManager::new(args.install_dir)?;
-            print_value(serde_json::to_value(manager.install(args.force)?)?, output)
-        }
-        WindbgCommand::Update(args) => {
-            let _ = args.json;
-            let manager = WindbgManager::new(args.install_dir)?;
-            print_value(serde_json::to_value(manager.update()?)?, output)
-        }
-        WindbgCommand::Path(args) => {
-            let _ = args.json;
-            let manager = WindbgManager::new(args.install_dir)?;
-            print_value(json!({ "dbgx_path": manager.dbgx_path()? }), output)
-        }
-        WindbgCommand::Run(args) => {
-            let _ = args.json;
-            let manager = WindbgManager::new(args.install_dir)?;
-            let installed = manager.install(false)?;
-            let status = Command::new(&installed.dbgx_path)
-                .args(&args.args)
-                .status()
-                .with_context(|| format!("launching {}", installed.dbgx_path.display()))?;
-            print_value(
-                json!({
-                    "dbgx_path": installed.dbgx_path,
-                    "success": status.success(),
-                    "exit_code": status.code(),
-                }),
-                output,
-            )
-        }
-    }
 }
 
 async fn run_mcp_stdio() -> anyhow::Result<()> {
@@ -1725,45 +1404,6 @@ async fn run_mcp_stdio() -> anyhow::Result<()> {
         .await
         .context("stdio MCP service failed")?;
     Ok(())
-}
-
-async fn run_daemon_command(
-    command: DaemonCommand,
-    pipe: String,
-    output: &OutputOptions,
-) -> anyhow::Result<()> {
-    match command {
-        DaemonCommand::Start { detach } => {
-            if detach {
-                let client = DaemonClient::new(pipe.clone());
-                if let Ok(health) = client.health().await {
-                    return print_value(health, output);
-                }
-                spawn_daemon(&pipe)?;
-                let client = DaemonClient::new(pipe);
-                print_value(client.health().await?, output)
-            } else {
-                run_daemon(pipe).await
-            }
-        }
-        DaemonCommand::Status => {
-            let client = DaemonClient::new(pipe);
-            print_value(client.health().await?, output)
-        }
-        DaemonCommand::Ensure => {
-            let client = DaemonClient::new(pipe.clone());
-            if let Ok(health) = client.health().await {
-                return print_value(health, output);
-            }
-            spawn_daemon(&pipe)?;
-            let client = DaemonClient::new(pipe);
-            print_value(client.health().await?, output)
-        }
-        DaemonCommand::Shutdown => {
-            let client = DaemonClient::new(pipe);
-            print_value(client.shutdown().await?, output)
-        }
-    }
 }
 
 async fn open_and_print(
@@ -2876,25 +2516,6 @@ fn call_status_value(result: anyhow::Result<Value>) -> Value {
     }
 }
 
-fn spawn_daemon(pipe: &str) -> anyhow::Result<()> {
-    let daemon_path = daemon_exe_path()?;
-    Command::new(&daemon_path)
-        .arg("daemon")
-        .arg("start")
-        .arg("--pipe")
-        .arg(pipe)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("spawning {}", daemon_path.display()))?;
-    Ok(())
-}
-
-fn daemon_exe_path() -> anyhow::Result<PathBuf> {
-    std::env::current_exe().context("reading current executable path")
-}
-
 async fn call_and_print(
     pipe: String,
     call: ToolCall,
@@ -2902,6 +2523,75 @@ async fn call_and_print(
 ) -> anyhow::Result<()> {
     let client = DaemonClient::new(pipe);
     print_value(client.call_tool(call).await?, output)
+}
+
+async fn live_start_and_print(
+    pipe: String,
+    args: LiveSessionStartArgs,
+    output: &OutputOptions,
+) -> anyhow::Result<()> {
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "live_launch_session".to_string(),
+            arguments: json!({
+                "command_line": args.command_line,
+                "initial_break_timeout_ms": args.initial_break_timeout_ms,
+            }),
+        },
+        output,
+    )
+    .await
+}
+
+async fn live_attach_and_print(
+    pipe: String,
+    args: LiveAttachArgs,
+    output: &OutputOptions,
+) -> anyhow::Result<()> {
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "live_attach_process".to_string(),
+            arguments: json!({
+                "process_id": args.process_id,
+                "initial_break_timeout_ms": args.initial_break_timeout_ms,
+            }),
+        },
+        output,
+    )
+    .await
+}
+
+async fn dump_open_and_print(
+    pipe: String,
+    args: DumpOpenArgs,
+    output: &OutputOptions,
+) -> anyhow::Result<()> {
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "dump_open_session".to_string(),
+            arguments: json!({
+                "path": args.path,
+            }),
+        },
+        output,
+    )
+    .await
+}
+
+async fn target_list_and_print(pipe: String, output: &OutputOptions) -> anyhow::Result<()> {
+    let client = DaemonClient::new(pipe);
+    print_value(client.targets().await?, output)
+}
+
+async fn start_watch_memory_job_and_print(
+    pipe: String,
+    args: SweepWatchMemoryArgs,
+    output: &OutputOptions,
+) -> anyhow::Result<()> {
+    call_and_print(pipe, watch_memory_job_call(args)?, output).await
 }
 
 fn load_call(args: LoadArgs) -> ToolCall {
@@ -2978,10 +2668,48 @@ fn discover_manifest() -> Value {
             "daemon": ["daemon ensure", "daemon status", "daemon shutdown", "sessions"],
             "context": ["context snapshot", "context snapshot --session <id> --cursor <id>"],
             "remote": ["remote explain", "remote server-command", "remote connect-command"],
-            "live": ["live capabilities", "live launch --command-line <cmd> --end detach|terminate"],
-            "breakpoint": ["breakpoint capabilities", "memory watchpoint", "sweep watch-memory"],
-            "datamodel": ["datamodel capabilities"],
-            "target": ["target capabilities", "target capabilities --session <id> --cursor <id>"],
+            "live": [
+                "live capabilities",
+                "live launch --command-line <cmd> --end detach|terminate",
+                "live start --command-line <cmd>",
+                "live attach --process-id <pid>"
+            ],
+            "dump": ["dump open <path>"],
+            "job": [
+                "job list",
+                "job status --job <id>",
+                "job result --job <id>",
+                "job cancel --job <id>",
+                "sweep watch-memory --background"
+            ],
+            "breakpoint": [
+                "breakpoint capabilities",
+                "breakpoint list --target <id>",
+                "breakpoint set --target <id> --address <addr>",
+                "breakpoint remove --target <id> --breakpoint-id <id>",
+                "memory watchpoint",
+                "sweep watch-memory"
+            ],
+            "datamodel": ["datamodel capabilities", "datamodel eval --target <id> --expression <expr>"],
+            "target": [
+                "target capabilities",
+                "target capabilities --session <id> --cursor <id>",
+                "target list",
+                "target status --target <id>",
+                "target close --target <id>",
+                "target terminate --target <id>",
+                "target wait --target <id>",
+                "target continue --target <id>",
+                "target step --target <id>",
+                "target threads --target <id>",
+                "target modules --target <id>",
+                "target registers --target <id>",
+                "target memory --target <id> --address <addr> --size <n>",
+                "target stack --target <id>",
+                "target disasm --target <id>",
+                "target symbol --target <id> --address <addr>",
+                "target source --target <id> --address <addr>"
+            ],
             "symbols": ["symbols diagnose --session <id>", "symbols diagnose --session <id> --name <module>", "symbols diagnose --session <id> --address <addr>", "symbols inspect <path>", "symbols exports <path>", "symbols nearest --session <id> --cursor <id> --address <addr>"],
             "source": ["source resolve <recorded-path> --search-path <root>"],
             "architecture": ["architecture state --session <id> --cursor <id>", "arch state --session <id> --cursor <id>"],
@@ -3329,7 +3057,34 @@ fn tool_command_map() -> Value {
         { "tool": "ttd_read_memory", "commands": ["memory read", "memory dump", "memory strings", "memory dps", "memory classify", "memory chase"] },
         { "tool": "ttd_memory_range", "commands": ["memory range"] },
         { "tool": "ttd_memory_buffer", "commands": ["memory buffer"] },
-        { "tool": "ttd_memory_watchpoint", "commands": ["memory watchpoint", "watchpoint"] }
+        { "tool": "ttd_memory_watchpoint", "commands": ["memory watchpoint", "watchpoint"] },
+        { "tool": "live_launch_session", "commands": ["live start"] },
+        { "tool": "live_attach_process", "commands": ["live attach"] },
+        { "tool": "dump_open_session", "commands": ["dump open"] },
+        { "tool": "target_list", "commands": ["target list"] },
+        { "tool": "target_status", "commands": ["target status"] },
+        { "tool": "target_close", "commands": ["target close"] },
+        { "tool": "target_terminate", "commands": ["target terminate"] },
+        { "tool": "target_wait", "commands": ["target wait"] },
+        { "tool": "target_continue", "commands": ["target continue"] },
+        { "tool": "target_step_into", "commands": ["target step"] },
+        { "tool": "target_core_registers", "commands": ["target registers"] },
+        { "tool": "target_read_memory", "commands": ["target memory"] },
+        { "tool": "target_list_threads", "commands": ["target threads"] },
+        { "tool": "target_list_modules", "commands": ["target modules"] },
+        { "tool": "target_symbol_by_offset", "commands": ["target symbol"] },
+        { "tool": "target_source_by_offset", "commands": ["target source"] },
+        { "tool": "target_stack_trace", "commands": ["target stack"] },
+        { "tool": "target_disassemble", "commands": ["target disasm"] },
+        { "tool": "target_list_breakpoints", "commands": ["breakpoint list"] },
+        { "tool": "target_set_breakpoint", "commands": ["breakpoint set"] },
+        { "tool": "target_remove_breakpoint", "commands": ["breakpoint remove"] },
+        { "tool": "target_evaluate_expression", "commands": ["datamodel eval"] },
+        { "tool": "job_start_watch_memory_sweep", "commands": ["sweep watch-memory --background"] },
+        { "tool": "job_list", "commands": ["job list"] },
+        { "tool": "job_status", "commands": ["job status"] },
+        { "tool": "job_result", "commands": ["job result"] },
+        { "tool": "job_cancel", "commands": ["job cancel"] }
     ])
 }
 
@@ -3427,6 +3182,16 @@ fn command_metadata() -> Value {
             "bounds": ["--max-hits"]
         },
         {
+            "command": "sweep watch-memory --background",
+            "requires_daemon": true,
+            "requires_native_ttd": true,
+            "session_required": true,
+            "cursor_required": true,
+            "cost": "daemon_owned_background_replay_job",
+            "safety": "read_only_replay_cursor_moves",
+            "bounds": ["--max-hits"]
+        },
+        {
             "command": "symbols inspect",
             "requires_daemon": false,
             "requires_native_ttd": false,
@@ -3460,12 +3225,110 @@ fn command_metadata() -> Value {
             "bounds": ["--initial-break-timeout-ms", "--end detach|terminate"]
         },
         {
+            "command": "live start",
+            "requires_daemon": true,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "launches_process_and_persists_target",
+            "safety": "live_debugging_changes_target_execution_state",
+            "bounds": ["--initial-break-timeout-ms"]
+        },
+        {
+            "command": "live attach",
+            "requires_daemon": true,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "attaches_to_process_and_persists_target",
+            "safety": "live_debugging_changes_target_execution_state"
+        },
+        {
+            "command": "dump open",
+            "requires_daemon": true,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "opens_dump_and_persists_target",
+            "safety": "read_only_dump_analysis"
+        },
+        {
             "command": "target capabilities",
             "requires_daemon": false,
             "requires_native_ttd": false,
             "session_required": false,
             "cost": "low",
             "safety": "read_only_discovery"
+        },
+        {
+            "command": "target list",
+            "requires_daemon": true,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "low",
+            "safety": "read_only"
+        },
+        {
+            "command": "target status",
+            "requires_daemon": true,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "low",
+            "safety": "read_only"
+        },
+        {
+            "command": "target memory",
+            "requires_daemon": true,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "bounded_memory_read",
+            "safety": "read_only_memory",
+            "bounds": ["--size"]
+        },
+        {
+            "command": "target stack",
+            "requires_daemon": true,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "low_to_medium",
+            "safety": "read_only"
+        },
+        {
+            "command": "target disasm",
+            "requires_daemon": true,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "low_to_medium",
+            "safety": "read_only"
+        },
+        {
+            "command": "breakpoint set",
+            "requires_daemon": true,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "low",
+            "safety": "live_debugging_changes_target_execution_state"
+        },
+        {
+            "command": "datamodel eval",
+            "requires_daemon": true,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "low",
+            "safety": "read_only"
+        },
+        {
+            "command": "job status",
+            "requires_daemon": true,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "low",
+            "safety": "read_only"
+        },
+        {
+            "command": "job cancel",
+            "requires_daemon": true,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "low",
+            "safety": "requests_background_cancellation"
         }
     ])
 }
@@ -3549,7 +3412,7 @@ fn ttd_api_coverage_manifest() -> Value {
                 "native_bridge": ["ttd_mcp_memory_watchpoint"],
                 "mcp_tools": ["ttd_memory_watchpoint"],
                 "cli_commands": ["memory watchpoint", "watchpoint"],
-                "notes": "First-hit replay is covered with the full TTD DataAccessMask vocabulary and optional thread filters; multi-hit sweep jobs remain a callback-sweep gap."
+                "notes": "First-hit replay is covered with the full TTD DataAccessMask vocabulary and optional thread filters; daemon-owned multi-hit sweep jobs now cover the most common bounded background replay workflow."
             },
             {
                 "id": "trace_list_packs",
@@ -3567,7 +3430,7 @@ fn ttd_api_coverage_manifest() -> Value {
                 "native_bridge": ["ttd_mcp_index_status", "ttd_mcp_index_file_stats", "ttd_mcp_build_index"],
                 "mcp_tools": ["ttd_index_status", "ttd_index_stats", "ttd_build_index"],
                 "cli_commands": ["index status", "index stats", "index build"],
-                "notes": "Synchronous status, stats, and build are covered; daemon-managed background jobs with cancellation remain future replay-job work."
+                "notes": "Synchronous status, stats, and build are covered; daemon-managed background jobs now cover bounded watch-memory sweeps with status, result retrieval, and cancellation."
             },
             {
                 "id": "recording_client_timeline",
@@ -3622,6 +3485,106 @@ fn session_call(name: &str, args: SessionArgs) -> ToolCall {
     ToolCall {
         name: name.to_string(),
         arguments: json!({ "session_id": args.session }),
+    }
+}
+
+fn target_call(name: &str, target: u64) -> ToolCall {
+    ToolCall {
+        name: name.to_string(),
+        arguments: json!({ "target_id": target }),
+    }
+}
+
+fn target_wait_call(args: TargetWaitArgs) -> ToolCall {
+    ToolCall {
+        name: "target_wait".to_string(),
+        arguments: json!({
+            "target_id": args.target,
+            "timeout_ms": args.timeout_ms,
+        }),
+    }
+}
+
+fn target_memory_call(args: TargetMemoryReadArgs) -> anyhow::Result<ToolCall> {
+    Ok(ToolCall {
+        name: "target_read_memory".to_string(),
+        arguments: json!({
+            "target_id": args.target,
+            "address": parse_u64_argument(&args.address)?,
+            "size": args.size,
+        }),
+    })
+}
+
+fn target_stack_call(args: TargetStackTraceArgs) -> ToolCall {
+    ToolCall {
+        name: "target_stack_trace".to_string(),
+        arguments: json!({
+            "target_id": args.target,
+            "max_frames": args.max_frames,
+        }),
+    }
+}
+
+fn target_disasm_call(args: TargetDisasmArgs) -> anyhow::Result<ToolCall> {
+    Ok(ToolCall {
+        name: "target_disassemble".to_string(),
+        arguments: json!({
+            "target_id": args.target,
+            "address": args.address.as_deref().map(parse_u64_argument).transpose()?,
+            "count": args.count,
+        }),
+    })
+}
+
+fn target_address_call(name: &str, args: TargetAddressArgs) -> anyhow::Result<ToolCall> {
+    Ok(ToolCall {
+        name: name.to_string(),
+        arguments: json!({
+            "target_id": args.target,
+            "address": parse_u64_argument(&args.address)?,
+        }),
+    })
+}
+
+fn breakpoint_set_call(args: BreakpointSetArgs) -> anyhow::Result<ToolCall> {
+    Ok(ToolCall {
+        name: "target_set_breakpoint".to_string(),
+        arguments: json!({
+            "target_id": args.target,
+            "address": parse_u64_argument(&args.address)?,
+            "kind": args.kind,
+            "size": args.size,
+        }),
+    })
+}
+
+fn breakpoint_remove_call(args: BreakpointRemoveArgs) -> ToolCall {
+    ToolCall {
+        name: "target_remove_breakpoint".to_string(),
+        arguments: json!({
+            "target_id": args.target,
+            "breakpoint_id": args.breakpoint_id,
+        }),
+    }
+}
+
+fn target_eval_call(args: DataModelEvalArgs) -> ToolCall {
+    ToolCall {
+        name: "target_evaluate_expression".to_string(),
+        arguments: json!({
+            "target_id": args.target,
+            "expression": args.expression,
+        }),
+    }
+}
+
+fn job_call(name: &str, job_id: u64) -> ToolCall {
+    ToolCall {
+        name: name.to_string(),
+        arguments: json!({
+            "job_id": job_id,
+        }),
     }
 }
 
@@ -3948,6 +3911,22 @@ fn step_call(args: StepArgs) -> ToolCall {
     }
 }
 
+fn watch_memory_job_call(args: SweepWatchMemoryArgs) -> anyhow::Result<ToolCall> {
+    Ok(ToolCall {
+        name: "job_start_watch_memory_sweep".to_string(),
+        arguments: json!({
+            "session_id": args.session,
+            "cursor_id": args.cursor,
+            "address": parse_u64_argument(&args.address)?,
+            "size": args.size,
+            "access": args.access,
+            "direction": args.direction,
+            "thread_unique_id": args.thread_unique_id,
+            "max_hits": args.max_hits,
+        }),
+    })
+}
+
 async fn replay_capabilities_and_print(
     pipe: String,
     args: SessionArgs,
@@ -4103,7 +4082,7 @@ async fn sweep_watch_memory_and_print(
             "notes": [
                 "This is a bounded client-side sweep over first-hit TTD watchpoints.",
                 "The command advances one step after each hit to avoid reporting the same position repeatedly.",
-                "Daemon-owned background jobs with progress/cancel remain future native/daemon work."
+                "Use --background to run the same bounded sweep as a daemon-owned job with status, result retrieval, and cancellation."
             ]
         }),
         output,
@@ -5371,68 +5350,6 @@ fn ensure_json_object(value: Value) -> anyhow::Result<Value> {
         Ok(value)
     } else {
         bail!("tool arguments must be a JSON object")
-    }
-}
-
-fn print_value(mut value: Value, output: &OutputOptions) -> anyhow::Result<()> {
-    if let Some(path) = output.field.as_deref() {
-        value = select_field(&value, path)?;
-    }
-
-    if output.raw {
-        print_raw(value)
-    } else if output.compact {
-        println!("{}", serde_json::to_string(&value)?);
-        Ok(())
-    } else {
-        println!("{}", serde_json::to_string_pretty(&value)?);
-        Ok(())
-    }
-}
-
-fn select_field(value: &Value, path: &str) -> anyhow::Result<Value> {
-    let mut current = value;
-    for segment in path.split('.') {
-        if segment.is_empty() {
-            bail!("field path contains an empty segment")
-        }
-        current = match current {
-            Value::Object(object) => object
-                .get(segment)
-                .with_context(|| format!("field '{segment}' was not found"))?,
-            Value::Array(items) => {
-                let index = segment
-                    .parse::<usize>()
-                    .with_context(|| format!("array field segment '{segment}' is not an index"))?;
-                items
-                    .get(index)
-                    .with_context(|| format!("array index {index} is out of range"))?
-            }
-            _ => bail!("field '{segment}' cannot be selected from a scalar value"),
-        };
-    }
-    Ok(current.clone())
-}
-
-fn print_raw(value: Value) -> anyhow::Result<()> {
-    match value {
-        Value::Null => Ok(()),
-        Value::Bool(value) => {
-            println!("{value}");
-            Ok(())
-        }
-        Value::Number(value) => {
-            println!("{value}");
-            Ok(())
-        }
-        Value::String(value) => {
-            println!("{value}");
-            Ok(())
-        }
-        other => {
-            println!("{}", serde_json::to_string(&other)?);
-            Ok(())
-        }
     }
 }
 

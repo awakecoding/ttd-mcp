@@ -66,6 +66,10 @@ impl DaemonClient {
         self.request_json("GET", "/sessions", None).await
     }
 
+    pub async fn targets(&self) -> anyhow::Result<Value> {
+        self.request_json("GET", "/targets", None).await
+    }
+
     pub async fn shutdown(&self) -> anyhow::Result<Value> {
         self.request_json("POST", "/shutdown", Some(Value::Null))
             .await
@@ -118,6 +122,10 @@ impl DaemonClient {
     }
 
     pub async fn sessions(&self) -> anyhow::Result<Value> {
+        self.health().await
+    }
+
+    pub async fn targets(&self) -> anyhow::Result<Value> {
         self.health().await
     }
 
@@ -246,6 +254,12 @@ mod windows {
                 StatusCode::OK,
                 json!({
                     "sessions": service.sessions().await,
+                }),
+            )),
+            (&Method::GET, "/targets") => Ok(json_response(
+                StatusCode::OK,
+                json!({
+                    "targets": service.targets().await,
                 }),
             )),
             (&Method::POST, "/tools/call") => {
