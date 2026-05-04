@@ -2,13 +2,13 @@ use anyhow::{bail, Context};
 use serde_json::{json, Value};
 use std::process::Command;
 use windbg_dbgeng::{
-    live_launch_initial_break, start_process_server, LiveLaunchEnd, LiveLaunchOptions,
-    ProcessServerOptions,
+    live_launch_initial_break, start_process_server, write_process_dump, DumpKind,
+    DumpWriteOptions, LiveLaunchEnd, LiveLaunchOptions, ProcessDumpOptions, ProcessServerOptions,
 };
 use windbg_install::WindbgManager;
 
 use super::output::{print_value, OutputOptions};
-use super::{DbgEngServerArgs, LiveLaunchArgs, WindbgCommand};
+use super::{CliDumpKind, DbgEngServerArgs, DumpCreateArgs, LiveLaunchArgs, WindbgCommand};
 
 pub(super) fn run_dbgeng_server(
     args: DbgEngServerArgs,
@@ -44,6 +44,35 @@ pub(super) fn run_live_launch(args: LiveLaunchArgs, output: &OutputOptions) -> a
     )
 }
 
+pub(super) fn run_dump_create(args: DumpCreateArgs, output: &OutputOptions) -> anyhow::Result<()> {
+    let result = write_process_dump(ProcessDumpOptions {
+        process_id: args.process_id,
+        initial_break_timeout_ms: args.initial_break_timeout_ms,
+        write: DumpWriteOptions {
+            path: args.output,
+            kind: cli_dump_kind(args.kind),
+            overwrite: args.overwrite,
+        },
+    })?;
+    print_value(
+        json!({
+            "result": result,
+            "session_persistence": "one_shot",
+            "notes": [
+                "DbgEng attaches to the process to create the dump and detaches before returning."
+            ]
+        }),
+        output,
+    )
+}
+
+fn cli_dump_kind(kind: CliDumpKind) -> DumpKind {
+    match kind {
+        CliDumpKind::Mini => DumpKind::Mini,
+        CliDumpKind::Full => DumpKind::Full,
+    }
+}
+
 pub(super) fn live_capabilities() -> Value {
     json!({
         "implemented": [
@@ -51,6 +80,8 @@ pub(super) fn live_capabilities() -> Value {
             "live launch --command-line <cmd> --end detach|terminate",
             "live start --command-line <cmd>",
             "live attach --process-id <pid>",
+            "dump create --process-id <pid> --output <path>",
+            "target dump --target <id> --output <path>",
             "target list/status/wait/continue/step for live targets",
             "target threads/modules/registers/memory/stack/disasm/symbol/source for live targets"
         ],
@@ -59,6 +90,11 @@ pub(super) fn live_capabilities() -> Value {
                 "feature": "live launch",
                 "status": "one_shot_initial_event",
                 "notes": "Launches under DbgEng, waits for the initial event, reports execution status, then detaches or terminates."
+            },
+            {
+                "feature": "dump creation",
+                "status": "dbgeng_write_dump",
+                "notes": "Creates mini or full process dumps through DbgEng, either one-shot from a process id or from a daemon-owned live target."
             },
             {
                 "feature": "daemon-backed live sessions",

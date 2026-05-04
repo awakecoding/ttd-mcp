@@ -1,0 +1,119 @@
+name: Smoke tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  dump-smoke:
+    name: Process dump smoke test
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select stable Rust
+        shell: pwsh
+        run: rustup default stable
+
+      - name: Restore debugger dependencies
+        shell: pwsh
+        run: cargo xtask deps
+
+      - name: Build windbg-tool
+        shell: pwsh
+        run: cargo build -p windbg-tool
+
+      - name: Create and inspect ping dump
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tool = Join-Path $PWD 'target\debug\windbg-tool.exe'
+          $dumpDir = Join-Path $env:RUNNER_TEMP 'windbg-tool-smoke'
+          New-Item -ItemType Directory -Path $dumpDir -Force | Out-Null
+          $dumpPath = Join-Path $dumpDir 'ping.dmp'
+          Remove-Item -Path $dumpPath -Force -ErrorAction SilentlyContinue
+
+          $ping = Start-Process `
+            -FilePath 'C:\Windows\System32\ping.exe' `
+            -ArgumentList @('127.0.0.1', '-n', '10') `
+            -PassThru
+
+          try {
+            Start-Sleep -Seconds 1
+
+            & $tool dump create `
+              --process-id $ping.Id `
+              --output $dumpPath `
+              --kind mini `
+              --overwrite | ConvertFrom-Json | Out-Null
+
+            if (-not (Test-Path $dumpPath)) {
+              throw "Expected dump file was not created: $dumpPath"
+            }
+
+            $dumpFile = Get-Item $dumpPath
+            if ($dumpFile.Length -le 0) {
+              throw "Dump file is empty: $dumpPath"
+            }
+          }
+          finally {
+            if (-not $ping.HasExited) {
+              Stop-Process -Id $ping.Id -Force
+              $ping.WaitForExit()
+            }
+          }
+
+          & $tool daemon ensure | ConvertFrom-Json | Out-Null
+
+          $opened = & $tool dump open $dumpPath | ConvertFrom-Json
+          if (-not $opened.target_id) {
+            throw "dump open did not return a target_id"
+          }
+          $target = $opened.target_id
+
+          $status = & $tool target status --target $target | ConvertFrom-Json
+          if ($status.target.kind -ne 'dump') {
+            throw "Expected dump target kind, got '$($status.target.kind)'"
+          }
+
+          $modules = & $tool target modules --target $target | ConvertFrom-Json
+          $pingModule = $modules.modules | Where-Object {
+            ($_.module_name -like '*ping*') -or
+            ($_.image_name -like '*ping.exe*') -or
+            ($_.loaded_image_name -like '*ping.exe*')
+          } | Select-Object -First 1
+          if (-not $pingModule) {
+            throw "Expected loaded modules to include ping.exe"
+          }
+
+          $threads = & $tool target threads --target $target | ConvertFrom-Json
+          if (-not $threads.threads -or $threads.threads.Count -lt 1) {
+            throw "Expected at least one thread in the dump"
+          }
+
+          $registers = & $tool target registers --target $target | ConvertFrom-Json
+          if (
+            -not $registers.registers.instruction_offset -and
+            -not $registers.registers.stack_offset -and
+            -not $registers.registers.frame_offset
+          ) {
+            throw "Expected at least one current-thread register offset in the dump"
+          }
+
+          $stack = & $tool target stack --target $target --max-frames 8 | ConvertFrom-Json
+          if (-not $stack.frames -or $stack.frames.Count -lt 1) {
+            throw "Expected at least one stack frame in the dump"
+          }
+
+      - name: Upload dump on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ping-dump-smoke
+          path: ${{ runner.temp }}\windbg-tool-smoke\ping.dmp
+          if-no-files-found: ignore
+          retention-days: 3

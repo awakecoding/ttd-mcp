@@ -995,6 +995,7 @@ fn required_args_for_tool(name: &str) -> anyhow::Result<&'static [&'static str]>
         | "target_list_breakpoints" => Ok(&["target_id"]),
         "target_wait" => Ok(&["target_id"]),
         "target_read_memory" => Ok(&["target_id", "address", "size"]),
+        "target_write_dump" => Ok(&["target_id", "path"]),
         "target_symbol_by_offset" | "target_source_by_offset" => Ok(&["target_id", "address"]),
         "target_stack_trace" => Ok(&["target_id"]),
         "target_disassemble" => Ok(&["target_id"]),

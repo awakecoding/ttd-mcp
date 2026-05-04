@@ -70,7 +70,7 @@ Representative command areas:
 - Discovery: `discover`, `recipes`, `tools`, `schema`
 - Session and replay: `open`, `load`, `sessions`, `info`, `position set`, `step`, `replay to`
 - Analysis: `symbols diagnose`, `disasm`, `memory dump`, `memory strings`, `memory chase`, `stack recover`, `stack backtrace`
-- Platform helpers: `remote explain`, `dbgeng server`, `live launch`, `windbg status`
+- Platform helpers: `remote explain`, `dbgeng server`, `live launch`, `dump create`, `windbg status`
 
 For a fuller CLI walkthrough, output-shaping flags, and command map, see [the CLI guide](docs/cli.md).
 
