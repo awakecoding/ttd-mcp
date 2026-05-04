@@ -73,25 +73,14 @@ jobs:
             }
           }
 
-          Write-Host 'Ensuring daemon'
-          & $tool daemon ensure | ConvertFrom-Json | Out-Null
-
-          Write-Host 'Opening dump'
-          $opened = & $tool dump open $dumpPath | ConvertFrom-Json
-          if (-not $opened.target_id) {
-            throw "dump open did not return a target_id"
-          }
-          $target = $opened.target_id
-
-          Write-Host 'Checking target status'
-          $status = & $tool target status --target $target | ConvertFrom-Json
-          if ($status.target.kind -ne 'dump') {
-            throw "Expected dump target kind, got '$($status.target.kind)'"
+          Write-Host 'Opening and inspecting dump'
+          $inspection = & $tool dump inspect $dumpPath --max-frames 8 | ConvertFrom-Json
+          if ($inspection.target.kind -ne 'dump') {
+            throw "Expected dump target kind, got '$($inspection.target.kind)'"
           }
 
           Write-Host 'Checking modules'
-          $modules = & $tool target modules --target $target | ConvertFrom-Json
-          $pingModule = $modules.modules | Where-Object {
+          $pingModule = $inspection.modules | Where-Object {
             ($_.module_name -like '*ping*') -or
             ($_.image_name -like '*ping.exe*') -or
             ($_.loaded_image_name -like '*ping.exe*')
@@ -101,24 +90,21 @@ jobs:
           }
 
           Write-Host 'Checking threads'
-          $threads = & $tool target threads --target $target | ConvertFrom-Json
-          if (-not $threads.threads -or $threads.threads.Count -lt 1) {
+          if (-not $inspection.threads -or $inspection.threads.Count -lt 1) {
             throw "Expected at least one thread in the dump"
           }
 
           Write-Host 'Checking registers'
-          $registers = & $tool target registers --target $target | ConvertFrom-Json
           if (
-            -not $registers.registers.instruction_offset -and
-            -not $registers.registers.stack_offset -and
-            -not $registers.registers.frame_offset
+            -not $inspection.registers.instruction_offset -and
+            -not $inspection.registers.stack_offset -and
+            -not $inspection.registers.frame_offset
           ) {
             throw "Expected at least one current-thread register offset in the dump"
           }
 
           Write-Host 'Checking stack'
-          $stack = & $tool target stack --target $target --max-frames 8 | ConvertFrom-Json
-          if (-not $stack.frames -or $stack.frames.Count -lt 1) {
+          if (-not $inspection.frames -or $inspection.frames.Count -lt 1) {
             throw "Expected at least one stack frame in the dump"
           }
 

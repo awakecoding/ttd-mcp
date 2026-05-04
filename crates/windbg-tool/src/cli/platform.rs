@@ -2,13 +2,16 @@ use anyhow::{bail, Context};
 use serde_json::{json, Value};
 use std::process::Command;
 use windbg_dbgeng::{
-    live_launch_initial_break, start_process_server, write_process_dump, DumpKind,
-    DumpWriteOptions, LiveLaunchEnd, LiveLaunchOptions, ProcessDumpOptions, ProcessServerOptions,
+    live_launch_initial_break, open_dump_session, start_process_server, write_process_dump,
+    DumpKind, DumpOpenOptions, DumpWriteOptions, LiveLaunchEnd, LiveLaunchOptions,
+    ProcessDumpOptions, ProcessServerOptions,
 };
 use windbg_install::WindbgManager;
 
 use super::output::{print_value, OutputOptions};
-use super::{CliDumpKind, DbgEngServerArgs, DumpCreateArgs, LiveLaunchArgs, WindbgCommand};
+use super::{
+    CliDumpKind, DbgEngServerArgs, DumpCreateArgs, DumpInspectArgs, LiveLaunchArgs, WindbgCommand,
+};
 
 pub(super) fn run_dbgeng_server(
     args: DbgEngServerArgs,
@@ -66,6 +69,23 @@ pub(super) fn run_dump_create(args: DumpCreateArgs, output: &OutputOptions) -> a
     )
 }
 
+pub(super) fn run_dump_inspect(
+    args: DumpInspectArgs,
+    output: &OutputOptions,
+) -> anyhow::Result<()> {
+    let session = open_dump_session(DumpOpenOptions { path: args.path })?;
+    print_value(
+        json!({
+            "target": session.summary(),
+            "modules": session.modules()?,
+            "threads": session.threads()?,
+            "registers": session.core_registers()?,
+            "frames": session.stack_trace(args.max_frames)?,
+        }),
+        output,
+    )
+}
+
 fn cli_dump_kind(kind: CliDumpKind) -> DumpKind {
     match kind {
         CliDumpKind::Mini => DumpKind::Mini,
@@ -81,6 +101,7 @@ pub(super) fn live_capabilities() -> Value {
             "live start --command-line <cmd>",
             "live attach --process-id <pid>",
             "dump create --process-id <pid> --output <path>",
+            "dump inspect <path>",
             "target dump --target <id> --output <path>",
             "target list/status/wait/continue/step for live targets",
             "target threads/modules/registers/memory/stack/disasm/symbol/source for live targets"

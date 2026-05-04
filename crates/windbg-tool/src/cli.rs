@@ -260,6 +260,8 @@ enum LiveCommand {
 enum DumpCommand {
     #[command(about = "Open a dump file as a daemon-owned target")]
     Open(DumpOpenArgs),
+    #[command(about = "Open and inspect a dump file without the daemon")]
+    Inspect(DumpInspectArgs),
     #[command(about = "Create a process dump from a live process id")]
     Create(DumpCreateArgs),
 }
@@ -540,6 +542,13 @@ struct DumpCreateArgs {
     overwrite: bool,
     #[arg(long, default_value_t = 5000)]
     initial_break_timeout_ms: u32,
+}
+
+#[derive(Debug, Args)]
+struct DumpInspectArgs {
+    path: PathBuf,
+    #[arg(long, default_value_t = 8)]
+    max_frames: u32,
 }
 
 #[derive(Debug, Args)]
@@ -2711,7 +2720,7 @@ fn discover_manifest() -> Value {
                 "live start --command-line <cmd>",
                 "live attach --process-id <pid>"
             ],
-            "dump": ["dump open <path>", "dump create --process-id <pid> --output <path>"],
+            "dump": ["dump open <path>", "dump inspect <path>", "dump create --process-id <pid> --output <path>"],
             "job": [
                 "job list",
                 "job status --job <id>",
@@ -3287,6 +3296,15 @@ fn command_metadata() -> Value {
             "session_required": false,
             "cost": "opens_dump_and_persists_target",
             "safety": "read_only_dump_analysis"
+        },
+        {
+            "command": "dump inspect",
+            "requires_daemon": false,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "opens_dump_and_reads_summary",
+            "safety": "read_only_dump_analysis",
+            "bounds": ["--max-frames"]
         },
         {
             "command": "dump create",
